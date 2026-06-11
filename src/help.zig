@@ -25,7 +25,7 @@ pub const overview =
     \\commands:
     \\  new [name] [-d] [-- cmd...]  start a session (attach unless -d)
     \\  attach, at, a <name>         attach a session (steals politely)
-    \\  ui                           manage sessions in a full-screen UI
+    \\  ui, i                        manage sessions in a full-screen UI
     \\  ls [--json]                  list sessions
     \\  send <name> [flags]          type into a session
     \\  peek <name>                  print the session's screen
@@ -102,8 +102,10 @@ pub const commands = [_]Entry{
     },
     .{
         .name = "ui",
+        .alias = "i",
         .body =
         \\usage: boo ui
+        \\       boo i
         \\
         \\Manage sessions in a full-screen interface: a sidebar lists
         \\every session (window title underneath) and the focused

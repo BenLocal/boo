@@ -67,7 +67,7 @@ automatically (pinned in `build.zig.zon`).
 boo new                    # new session running $SHELL, attached
 boo new work               # named session
 boo new work -d -- make    # create detached, running a command
-boo ui                     # manage sessions in a full-screen UI
+boo ui                     # manage sessions in a full-screen UI (alias: i)
 boo ls                     # list sessions
 boo attach work            # reattach (steals if attached elsewhere)
 boo a w                    # same: alias + unique-prefix matching

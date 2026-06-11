@@ -65,7 +65,7 @@ pub fn main() !void {
 
     if (eql(cmd, "new")) return cmdNew(alloc, rest);
     if (eql(cmd, "attach") or eql(cmd, "at") or eql(cmd, "a")) return cmdAttach(alloc, rest);
-    if (eql(cmd, "ui")) return cmdUi(alloc, rest);
+    if (eql(cmd, "ui") or eql(cmd, "i")) return cmdUi(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);

@@ -1274,6 +1274,17 @@ test "ui: the empty state shows the ghost and the keybind hint" {
     try ui.waitFor("Press Ctrl+A for Keybinds");
 }
 
+test "ui: 'i' is the documented shorthand" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    var ui = try PtyClient.spawn(&h, &.{"i"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("no sessions");
+    try ui.waitFor("Press Ctrl+A for Keybinds");
+}
+
 test "ui: clicking a session in the sidebar focuses it" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

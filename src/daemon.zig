@@ -16,6 +16,7 @@ const paths = @import("paths.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
 const main = @import("main.zig");
+const config = @import("config.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -26,6 +27,8 @@ pub const Options = struct {
     argv: []const []const u8,
     rows: u16 = 24,
     cols: u16 = 80,
+    /// Scrollback budget in bytes for the session terminal.
+    max_scrollback: usize = config.default_max_scrollback,
 };
 
 const Conn = struct {
@@ -106,7 +109,7 @@ pub const Daemon = struct {
             .flags = 0,
         }, null);
 
-        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols);
+        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols, opts.max_scrollback);
 
         try self.loop();
     }
@@ -558,6 +561,7 @@ pub const Daemon = struct {
         argv: []const []const u8,
         rows: u16,
         cols: u16,
+        max_scrollback: usize,
     ) !*Window {
         var env = try std.process.getEnvMap(alloc);
         defer env.deinit();
@@ -567,7 +571,7 @@ pub const Daemon = struct {
         var default_argv: [1][]const u8 = .{env.get("SHELL") orelse "/bin/sh"};
         const child_argv: []const []const u8 = if (argv.len > 0) argv else &default_argv;
 
-        return Window.create(alloc, child_argv, &env, rows, cols);
+        return Window.create(alloc, child_argv, &env, rows, cols, max_scrollback);
     }
 
     fn liveWindow(self: *Daemon) ?*Window {

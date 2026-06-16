@@ -10,6 +10,7 @@ const help = @import("help.zig");
 const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
+const config = @import("config.zig");
 
 pub const version = "0.5.20";
 
@@ -278,6 +279,11 @@ fn createSession(
     paths.validateName(name) catch
         usageFail("new", "invalid session name '{s}'", .{name});
 
+    var cfg = config.Config.load(alloc) catch |err|
+        fail(exit_runtime, "failed to read config: {s}", .{@errorName(err)});
+    const max_scrollback = cfg.max_scrollback;
+    cfg.deinit(alloc);
+
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
 
@@ -302,12 +308,13 @@ fn createSession(
             .argv = cmd_argv,
             .state_dir = dir,
             .cwd = cwd,
+            .max_scrollback = max_scrollback,
         });
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv, dir, cwd);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv, dir, cwd, max_scrollback);
     }
     posix.close(listen_fd);
 
@@ -424,7 +431,13 @@ fn cmdUi(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    ui.run(alloc, dir) catch |err| switch (err) {
+
+    var cfg = config.Config.load(alloc) catch |err|
+        fail(exit_runtime, "failed to read config: {s}", .{@errorName(err)});
+    const max_scrollback = cfg.max_scrollback;
+    cfg.deinit(alloc);
+
+    ui.run(alloc, dir, max_scrollback) catch |err| switch (err) {
         error.NotATty => fail(exit_runtime, "ui requires a terminal", .{}),
         else => return err,
     };
@@ -968,6 +981,7 @@ fn runDaemon(
     argv: []const []const u8,
     state_dir: []const u8,
     cwd: ?[]const u8,
+    max_scrollback: usize,
 ) noreturn {
     _ = posix.setsid() catch {};
 
@@ -996,6 +1010,7 @@ fn runDaemon(
         .argv = argv,
         .state_dir = state_dir,
         .cwd = cwd,
+        .max_scrollback = max_scrollback,
     }) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);

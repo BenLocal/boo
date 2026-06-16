@@ -55,6 +55,7 @@ pub const Window = struct {
         env: *std.process.EnvMap,
         rows: u16,
         cols: u16,
+        max_scrollback: usize,
         cwd: ?[]const u8,
     ) !*Window {
         const self = try alloc.create(Window);
@@ -82,7 +83,7 @@ pub const Window = struct {
         self.term = try vt.Terminal.init(alloc, .{
             .cols = cols,
             .rows = rows,
-            .max_scrollback = 512 * 1024,
+            .max_scrollback = max_scrollback,
         });
         errdefer self.term.deinit(alloc);
 

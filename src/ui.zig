@@ -29,6 +29,7 @@ const paths = @import("paths.zig");
 const protocol = @import("protocol.zig");
 const ptypkg = @import("pty.zig");
 const windowpkg = @import("window.zig");
+const config = @import("config.zig");
 
 const log = std.log.scoped(.ui);
 
@@ -640,6 +641,7 @@ pub const View = struct {
         socket_path: []const u8,
         rows: u16,
         cols: u16,
+        max_scrollback: usize,
     ) !*View {
         const self = try alloc.create(View);
         errdefer alloc.destroy(self);
@@ -662,7 +664,7 @@ pub const View = struct {
             // Output that scrolls off while attached accumulates
             // here; the wheel pages through it for primary-screen
             // applications.
-            .max_scrollback = 512 * 1024,
+            .max_scrollback = max_scrollback,
         });
         errdefer self.term.deinit(alloc);
 
@@ -1003,11 +1005,11 @@ const enter_sequence =
 /// reset_state_sequence turns every mode above back off.
 const restore_sequence = windowpkg.reset_state_sequence ++ "\x1b[?1049l";
 
-pub fn run(alloc: std.mem.Allocator, dir: []const u8) !void {
+pub fn run(alloc: std.mem.Allocator, dir: []const u8, max_scrollback: usize) !void {
     const tty: posix.fd_t = 0;
     if (!posix.isatty(tty)) return error.NotATty;
 
-    var ui: Ui = .{ .alloc = alloc, .dir = dir, .tty = tty };
+    var ui: Ui = .{ .alloc = alloc, .dir = dir, .tty = tty, .max_scrollback = max_scrollback };
     defer ui.deinit();
 
     // Signal plumbing mirrors client.attach: WINCH relayouts,
@@ -1093,6 +1095,9 @@ const Ui = struct {
     alloc: std.mem.Allocator,
     dir: []const u8,
     tty: posix.fd_t,
+    /// Scrollback budget in bytes for each attached view's terminal.
+    /// `run` sets this from config; the default only covers test fixtures.
+    max_scrollback: usize = config.default_max_scrollback,
 
     layout: Layout = .{ .rows = 24, .cols = 80, .sidebar_w = 24 },
     sessions: std.ArrayList(Entry) = .empty,
@@ -2235,6 +2240,7 @@ const Ui = struct {
             sock,
             self.layout.viewportRows(),
             self.layout.viewportCols(),
+            self.max_scrollback,
         ) catch |err| {
             self.setMessage("attach {s} failed: {s}", .{ name, @errorName(err) });
             return;

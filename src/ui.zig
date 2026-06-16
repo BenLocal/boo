@@ -1136,6 +1136,9 @@ const Ui = struct {
     /// Width kept by a completed resize, reapplied (clamped) when
     /// the terminal itself resizes. Null until the first resize.
     sidebar_pref: ?u16 = null,
+    /// A left-button drag on the separator column is resizing the
+    /// sidebar; motion follows the cursor until the button releases.
+    divider_drag: bool = false,
     /// Transient status message and its expiry time.
     message: std.ArrayList(u8) = .empty,
     message_deadline: i64 = 0,
@@ -1663,6 +1666,22 @@ const Ui = struct {
             return self.dragSelection(m, x -| self.layout.viewportX(), y);
         }
 
+        // An in-progress divider drag follows the cursor column,
+        // resizing the sidebar live; the release commits the width so a
+        // later terminal resize keeps it.
+        if (self.divider_drag and !m.isWheel() and (m.isMotion() or m.release)) {
+            if (m.release) {
+                self.divider_drag = false;
+                self.sidebar_pref = self.layout.sidebar_w;
+                // Repaint so the separator drops back to the light line.
+                self.full_render = true;
+                self.need_render = true;
+            } else {
+                self.applySidebarWidth(x);
+            }
+            return;
+        }
+
         if (m.isWheel() and !m.release) {
             switch (self.layout.hit(x, y)) {
                 .viewport => return self.wheelViewport(m),
@@ -1679,6 +1698,19 @@ const Ui = struct {
                     return;
                 },
             }
+        }
+
+        // A left press on the separator column (between the sidebar and
+        // the viewport) grabs the divider for a resize, ahead of the
+        // hit test that would otherwise treat the column as dead space.
+        if (!self.layout.hidden and !m.release and !m.isMotion() and !m.isWheel() and
+            m.code & 3 == 0 and x == self.layout.sidebar_w)
+        {
+            self.divider_drag = true;
+            // Repaint so the separator thickens on grab, before any drag.
+            self.full_render = true;
+            self.need_render = true;
+            return;
         }
 
         switch (self.layout.hit(x, y)) {
@@ -2804,8 +2836,15 @@ const Ui = struct {
         }
         if (!self.layout.hidden) {
             try self.composeSidebarCell(y, out);
-            try out.appendSlice(alloc, style_dim);
-            try out.appendSlice(alloc, "\u{2502}");
+            // The separator thickens to a heavy, undimmed line while it
+            // is being dragged — a visible grab affordance, since the
+            // terminal will not give us a resize mouse cursor.
+            if (self.divider_drag) {
+                try out.appendSlice(alloc, "\u{2503}"); // heavy vertical
+            } else {
+                try out.appendSlice(alloc, style_dim);
+                try out.appendSlice(alloc, "\u{2502}"); // light vertical
+            }
             try out.appendSlice(alloc, sgr_reset);
         }
         try self.composeViewportCell(y, out);
@@ -3843,6 +3882,72 @@ test "ui: sidebar resize clamps to the layout bounds" {
     // Tiny terminals collapse the range to the floor.
     ui.layout.cols = 15;
     try std.testing.expectEqual(@as(u16, 8), ui.clampSidebarWidth(999));
+}
+
+test "ui: dragging the separator resizes the sidebar live" {
+    var ui: Ui = .{ .alloc = std.testing.allocator, .dir = "", .tty = -1 };
+    ui.layout = .{ .rows = 24, .cols = 100, .sidebar_w = 24 };
+
+    // Left-press the separator column (0-based 24 -> 1-based 25): the
+    // drag arms but the width does not move yet.
+    try ui.handleMouse(.{ .code = 0, .x = 25, .y = 5, .release = false });
+    try std.testing.expect(ui.divider_drag);
+    try std.testing.expectEqual(@as(u16, 24), ui.layout.sidebar_w);
+
+    // Drag right: the separator follows the cursor (0-based 40).
+    try ui.handleMouse(.{ .code = 32, .x = 41, .y = 5, .release = false });
+    try std.testing.expectEqual(@as(u16, 40), ui.layout.sidebar_w);
+    try std.testing.expect(ui.divider_drag);
+
+    // Past the floor: clamps to the minimum width (8).
+    try ui.handleMouse(.{ .code = 32, .x = 3, .y = 5, .release = false });
+    try std.testing.expectEqual(@as(u16, 8), ui.layout.sidebar_w);
+
+    // Past the cap: clamps so the viewport keeps a sliver (cols-12 = 88).
+    try ui.handleMouse(.{ .code = 32, .x = 96, .y = 5, .release = false });
+    try std.testing.expectEqual(@as(u16, 88), ui.layout.sidebar_w);
+
+    // Release ends the drag and persists the width for relayout.
+    try ui.handleMouse(.{ .code = 0, .x = 96, .y = 5, .release = true });
+    try std.testing.expect(!ui.divider_drag);
+    try std.testing.expectEqual(@as(?u16, 88), ui.sidebar_pref);
+}
+
+test "ui: a press off the separator does not start a divider drag" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    ui.layout = .{ .rows = 24, .cols = 100, .sidebar_w = 24 };
+
+    // A press inside the sidebar list is not the separator.
+    try ui.handleMouse(.{ .code = 0, .x = 6, .y = 1, .release = false });
+    try std.testing.expect(!ui.divider_drag);
+
+    // With the sidebar hidden there is no separator to grab.
+    ui.layout.hidden = true;
+    try ui.handleMouse(.{ .code = 0, .x = 25, .y = 5, .release = false });
+    try std.testing.expect(!ui.divider_drag);
+}
+
+test "ui: the separator thickens while a divider drag is active" {
+    const alloc = std.testing.allocator;
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    ui.layout = .{ .rows = 24, .cols = 40, .sidebar_w = 12 };
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+
+    // Idle: the separator is the light vertical line.
+    try ui.composeRow(0, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\u{2502}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\u{2503}") == null);
+
+    // While dragging: it thickens to the heavy vertical line.
+    out.clearRetainingCapacity();
+    ui.divider_drag = true;
+    try ui.composeRow(0, &out);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "\u{2503}") != null);
 }
 
 test "layout: hidden sidebar gives the viewport every column" {

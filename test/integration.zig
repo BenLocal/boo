@@ -445,6 +445,36 @@ test "restore: a killed session comes back in its saved directory" {
     defer alloc.free(peek);
 }
 
+test "restore: a clean command exit drops the snapshot" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // cat waits for stdin; the daemon snapshots its cwd at startup.
+    try h.startDetached("c", &.{"cat"});
+    const state = try std.fs.path.join(alloc, &.{ h.dir, "c.state" });
+    defer alloc.free(state);
+
+    // Wait for the snapshot to be written.
+    var d1 = Deadline.init(default_timeout_ms);
+    while (true) {
+        const content = std.fs.cwd().readFileAlloc(alloc, state, 4096) catch "";
+        defer if (content.len > 0) alloc.free(content);
+        if (content.len > 0) break;
+        try d1.tick("snapshot never written");
+    }
+
+    // Ctrl-D (EOF) makes cat exit on its own.
+    try h.runOk(&.{ "send", "c", "--text", "\x04" });
+
+    // The snapshot is removed, so the session is not restorable.
+    var d2 = Deadline.init(default_timeout_ms);
+    while (true) {
+        std.fs.cwd().access(state, .{}) catch break; // gone
+        try d2.tick("snapshot not removed on clean exit");
+    }
+}
+
 test "vt sequences: cursor movement, SGR, and clear are emulated" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

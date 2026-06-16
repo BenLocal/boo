@@ -85,6 +85,10 @@ pub const Daemon = struct {
 
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
+    /// Set when the session was killed (vs the command exiting on its
+    /// own). A killed session keeps its restore snapshot; a clean exit
+    /// drops it, since there is nothing meaningful to restore.
+    killed: bool = false,
 
     /// How often the session's working directory is snapshotted for restore.
     const snapshot_interval_ms: i64 = 30_000;
@@ -135,6 +139,8 @@ pub const Daemon = struct {
         }
         self.conns.deinit(self.alloc);
         self.retireListener();
+        // A clean command exit leaves nothing to restore; a kill keeps it.
+        if (!self.killed) self.deleteSnapshot();
         if (self.owned_name) |n| self.alloc.free(n);
         if (self.owned_socket_path) |p| self.alloc.free(p);
         if (self.sig_read >= 0) posix.close(self.sig_read);
@@ -200,6 +206,16 @@ pub const Daemon = struct {
         } else {
             std.fs.cwd().deleteFile(tmp) catch {};
         }
+    }
+
+    /// Remove the restore snapshot. Called when the session command
+    /// exited on its own, so `boo restore` will not bring it back.
+    fn deleteSnapshot(self: *Daemon) void {
+        const dir = self.opts.state_dir orelse return;
+        const name = self.owned_name orelse self.opts.name;
+        const path = paths.statePath(self.alloc, dir, name) catch return;
+        defer self.alloc.free(path);
+        std.fs.cwd().deleteFile(path) catch {};
     }
 
     fn loop(self: *Daemon) !void {
@@ -493,6 +509,7 @@ pub const Daemon = struct {
             }
             self.broadcastExit("session terminated");
             self.quitting = true;
+            self.killed = true;
         } else {
             conn.send(.err, "unknown command");
         }

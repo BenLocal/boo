@@ -398,6 +398,53 @@ test "detached session: send and peek round-trip through libghostty" {
     defer alloc.free(content);
 }
 
+test "restore: a killed session comes back in its saved directory" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A directory for the session's shell to run in.
+    const work = try std.fs.path.join(alloc, &.{ h.dir, "work" });
+    defer alloc.free(work);
+    try std.fs.cwd().makePath(work);
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try std.fs.cwd().realpath(work, &real_buf);
+
+    // Create session 'r' with a fresh shell started in `work`.
+    {
+        const res = try h.runIn(work, &.{ "new", "r", "-d" });
+        defer alloc.free(res.stdout);
+        defer alloc.free(res.stderr);
+        try std.testing.expect(res.term == .Exited and res.term.Exited == 0);
+    }
+    try h.waitSessionUp("r");
+
+    // The daemon snapshots the working directory to <dir>/r.state.
+    const state = try std.fs.path.join(alloc, &.{ h.dir, "r.state" });
+    defer alloc.free(state);
+    const expected = try std.fmt.allocPrint(alloc, "{s}\n", .{real});
+    defer alloc.free(expected);
+    try waitFileEquals(alloc, state, expected);
+
+    // Kill it; the snapshot must survive so it can be restored.
+    try h.runOk(&.{ "kill", "r" });
+    const sock = try std.fs.path.join(alloc, &.{ h.dir, "r.sock" });
+    defer alloc.free(sock);
+    var deadline = Deadline.init(default_timeout_ms);
+    while (true) {
+        std.fs.cwd().access(sock, .{}) catch break; // socket gone == daemon exited
+        try deadline.tick("socket not removed after kill");
+    }
+    try std.fs.cwd().access(state, .{}); // snapshot still present
+
+    // Restore re-creates the session; its shell is in the saved directory.
+    try h.runOk(&.{ "restore", "r" });
+    try h.waitSessionUp("r");
+    try h.sendLine("r", "pwd");
+    const peek = try h.waitPeekContains("r", real);
+    defer alloc.free(peek);
+}
+
 test "vt sequences: cursor movement, SGR, and clear are emulated" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

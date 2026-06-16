@@ -26,6 +26,12 @@ pub const Options = struct {
     argv: []const []const u8,
     rows: u16 = 24,
     cols: u16 = 80,
+    /// Directory under which the session's restore snapshot is written
+    /// (the socket directory). Null disables snapshots.
+    state_dir: ?[]const u8 = null,
+    /// Starting directory for the session command; set by `boo restore`
+    /// to re-create the session where it was. Null inherits the cwd.
+    cwd: ?[]const u8 = null,
 };
 
 const Conn = struct {
@@ -74,8 +80,14 @@ pub const Daemon = struct {
     /// or client input; reported as session idle time.
     last_activity_ms: i64 = 0,
 
+    /// Wall-clock time (milliseconds) of the last restore snapshot.
+    last_save_ms: i64 = 0,
+
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
+
+    /// How often the session's working directory is snapshotted for restore.
+    const snapshot_interval_ms: i64 = 30_000;
 
     pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
         var self: Daemon = .{
@@ -109,7 +121,7 @@ pub const Daemon = struct {
             .flags = 0,
         }, null);
 
-        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols);
+        self.win = try createWindow(self.alloc, opts.name, opts.argv, self.rows, self.cols, opts.cwd);
 
         try self.loop();
     }
@@ -137,6 +149,57 @@ pub const Daemon = struct {
         posix.close(self.opts.listen_fd);
         self.opts.listen_fd = -1;
         std.fs.cwd().deleteFile(self.opts.socket_path) catch {};
+    }
+
+    /// Poll timeout (ms) until the next restore snapshot is due, or -1
+    /// (block indefinitely) when snapshots are disabled.
+    fn snapshotTimeout(self: *Daemon) i32 {
+        if (self.opts.state_dir == null) return -1;
+        const due = self.last_save_ms + snapshot_interval_ms;
+        const now = std.time.milliTimestamp();
+        if (now >= due) return 0;
+        return @intCast(@min(due - now, snapshot_interval_ms));
+    }
+
+    fn maybeSaveSnapshot(self: *Daemon) void {
+        if (self.opts.state_dir == null) return;
+        const now = std.time.milliTimestamp();
+        if (now - self.last_save_ms < snapshot_interval_ms) return;
+        self.last_save_ms = now;
+        self.saveSnapshot();
+    }
+
+    /// Atomically write the session's current working directory to
+    /// <state_dir>/<name>.state so `boo restore` can re-create it there.
+    fn saveSnapshot(self: *Daemon) void {
+        const dir = self.opts.state_dir orelse return;
+        const w = self.liveWindow() orelse return;
+        if (w.child_pid <= 0) return;
+
+        var link_buf: [64]u8 = undefined;
+        const link = std.fmt.bufPrint(&link_buf, "/proc/{d}/cwd", .{w.child_pid}) catch return;
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.readlink(link, &cwd_buf) catch return;
+        if (cwd.len == 0) return;
+
+        const name = self.owned_name orelse self.opts.name;
+        const path = paths.statePath(self.alloc, dir, name) catch return;
+        defer self.alloc.free(path);
+        const tmp = std.fmt.allocPrint(self.alloc, "{s}.tmp", .{path}) catch return;
+        defer self.alloc.free(tmp);
+
+        const ok = blk: {
+            const f = std.fs.cwd().createFile(tmp, .{ .truncate = true }) catch break :blk false;
+            defer f.close();
+            f.writeAll(cwd) catch break :blk false;
+            f.writeAll("\n") catch break :blk false;
+            break :blk true;
+        };
+        if (ok) {
+            std.fs.cwd().rename(tmp, path) catch {};
+        } else {
+            std.fs.cwd().deleteFile(tmp) catch {};
+        }
     }
 
     fn loop(self: *Daemon) !void {
@@ -174,7 +237,7 @@ pub const Daemon = struct {
                 }
             }
 
-            _ = try posix.poll(fds.items, -1);
+            _ = try posix.poll(fds.items, self.snapshotTimeout());
 
             for (fds.items, refs.items) |pfd, ref| {
                 if (pfd.revents == 0) continue;
@@ -187,6 +250,7 @@ pub const Daemon = struct {
                 if (self.quitting) break;
             }
 
+            self.maybeSaveSnapshot();
             self.sweep();
             if (self.liveWindow() == null) {
                 self.broadcastExit("command exited");
@@ -567,6 +631,7 @@ pub const Daemon = struct {
         argv: []const []const u8,
         rows: u16,
         cols: u16,
+        cwd: ?[]const u8,
     ) !*Window {
         var env = try std.process.getEnvMap(alloc);
         defer env.deinit();
@@ -576,7 +641,7 @@ pub const Daemon = struct {
         var default_argv: [1][]const u8 = .{env.get("SHELL") orelse "/bin/sh"};
         const child_argv: []const []const u8 = if (argv.len > 0) argv else &default_argv;
 
-        return Window.create(alloc, child_argv, &env, rows, cols);
+        return Window.create(alloc, child_argv, &env, rows, cols, cwd);
     }
 
     fn liveWindow(self: *Daemon) ?*Window {

@@ -82,6 +82,46 @@ pub fn socketPath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !
     return std.fs.path.join(alloc, &.{ dir, file });
 }
 
+/// Path of a session's restore snapshot: "<dir>/<name>.state". The file
+/// holds the session's working directory, periodically saved by the
+/// daemon so `boo restore` can re-create the session in the same place.
+pub fn statePath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![]u8 {
+    const file = try std.fmt.allocPrint(alloc, "{s}.state", .{name});
+    defer alloc.free(file);
+    return std.fs.path.join(alloc, &.{ dir, file });
+}
+
+/// Names of sessions with a saved snapshot but no live socket: the
+/// killed/dead sessions that `boo restore` can bring back. Caller frees
+/// each name and the list.
+pub fn restorableSessions(alloc: std.mem.Allocator, dir_path: []const u8) ![][]u8 {
+    var names: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+
+    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return names.toOwnedSlice(alloc),
+        else => return err,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".state")) continue;
+        const name = entry.name[0 .. entry.name.len - ".state".len];
+        validateName(name) catch continue;
+        // Skip sessions that are still running (a live socket exists).
+        const sock = std.fmt.allocPrint(alloc, "{s}.sock", .{name}) catch continue;
+        defer alloc.free(sock);
+        if (dir.access(sock, .{})) |_| continue else |_| {}
+        try names.append(alloc, try alloc.dupe(u8, name));
+    }
+
+    return names.toOwnedSlice(alloc);
+}
+
 /// Map an arbitrary string onto the session-name character set: bytes
 /// outside the allowed set become '-' and overlong input is truncated.
 /// Returns null when the result still fails validation, e.g. empty input
@@ -178,6 +218,39 @@ test "socketPath" {
     const p = try socketPath(alloc, "/run/gs", "work");
     defer alloc.free(p);
     try std.testing.expectEqualStrings("/run/gs/work.sock", p);
+}
+
+test "statePath" {
+    const alloc = std.testing.allocator;
+    const p = try statePath(alloc, "/run/gs", "work");
+    defer alloc.free(p);
+    try std.testing.expectEqualStrings("/run/gs/work.state", p);
+}
+
+test "restorableSessions lists snapshots without a live socket" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(base);
+
+    // dead: a snapshot with no socket -> restorable.
+    try tmp.dir.writeFile(.{ .sub_path = "dead.state", .data = "/home/u\n" });
+    // live: a snapshot with a socket -> still running, skip.
+    try tmp.dir.writeFile(.{ .sub_path = "live.state", .data = "/tmp\n" });
+    try tmp.dir.writeFile(.{ .sub_path = "live.sock", .data = "" });
+    // a bare socket with no snapshot is not restorable either.
+    try tmp.dir.writeFile(.{ .sub_path = "running.sock", .data = "" });
+    // an invalid name is ignored.
+    try tmp.dir.writeFile(.{ .sub_path = ".hidden.state", .data = "/x" });
+
+    const names = try restorableSessions(alloc, base);
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    try std.testing.expectEqual(@as(usize, 1), names.len);
+    try std.testing.expectEqualStrings("dead", names[0]);
 }
 
 test "socketDirFrom prefers BOO_DIR and creates it" {

@@ -86,6 +86,7 @@ pub fn main() !void {
 
     if (eql(cmd, "new")) return cmdNew(alloc, rest);
     if (eql(cmd, "attach") or eql(cmd, "at") or eql(cmd, "a")) return cmdAttach(alloc, rest);
+    if (eql(cmd, "restore")) return cmdRestore(alloc, rest);
     if (eql(cmd, "ui") or eql(cmd, "i")) return cmdUi(alloc, rest);
     if (eql(cmd, "ls") or eql(cmd, "list")) return cmdLs(alloc, rest);
     if (eql(cmd, "send")) return cmdSend(alloc, rest);
@@ -261,7 +262,7 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv));
+    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), null);
 }
 
 fn createSession(
@@ -270,6 +271,7 @@ fn createSession(
     name_opt: ?[]const u8,
     detached: bool,
     cmd_argv: []const []const u8,
+    cwd: ?[]const u8,
 ) !void {
     var name_buf: [paths.max_name_len]u8 = undefined;
     const name = name_opt orelse paths.defaultName(&name_buf, dir);
@@ -298,12 +300,14 @@ fn createSession(
             .socket_path = sock,
             .listen_fd = listen_fd,
             .argv = cmd_argv,
+            .state_dir = dir,
+            .cwd = cwd,
         });
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv, dir, cwd);
     }
     posix.close(listen_fd);
 
@@ -313,6 +317,63 @@ fn createSession(
         return;
     }
     try attachLoop(alloc, dir, name);
+}
+
+/// Re-create killed sessions in their last working directory. With a
+/// name, restores just that session; with none, every session that has a
+/// saved snapshot but no live socket.
+fn cmdRestore(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    var name_arg: ?[]const u8 = null;
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("restore");
+        if (arg.len > 0 and arg[0] == '-') usageFail("restore", "unknown flag '{s}'", .{arg});
+        if (name_arg != null) usageFail("restore", "unexpected argument '{s}'", .{arg});
+        name_arg = arg;
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+
+    if (name_arg) |want| {
+        restoreOne(alloc, dir, want) catch |err| switch (err) {
+            error.AlreadyRunning => fail(exit_runtime, "session {s} is already running", .{want}),
+            error.NoSnapshot => fail(exit_no_session, "no snapshot for session '{s}' (run 'boo ls')", .{want}),
+            else => return err,
+        };
+        return;
+    }
+
+    const names = try paths.restorableSessions(alloc, dir);
+    defer {
+        for (names) |n| alloc.free(n);
+        alloc.free(names);
+    }
+    if (names.len == 0) return stdoutWrite("nothing to restore\n");
+    for (names) |n| restoreOne(alloc, dir, n) catch |err| {
+        std.debug.print("boo: restore {s} failed: {s}\n", .{ n, @errorName(err) });
+    };
+}
+
+fn restoreOne(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+    paths.validateName(name) catch usageFail("restore", "invalid session name '{s}'", .{name});
+
+    // A live socket means the session is still running.
+    const sock = try paths.socketPath(alloc, dir, name);
+    defer alloc.free(sock);
+    if (std.fs.cwd().access(sock, .{})) |_| return error.AlreadyRunning else |_| {}
+
+    const state = try paths.statePath(alloc, dir, name);
+    defer alloc.free(state);
+    const raw = std.fs.cwd().readFileAlloc(alloc, state, 64 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return error.NoSnapshot,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    const saved = std.mem.trim(u8, raw, " \t\r\n");
+    const cwd: ?[]const u8 = if (saved.len > 0) saved else null;
+
+    // Detached, fresh shell ($SHELL), started in the saved directory.
+    try createSession(alloc, dir, name, true, &.{}, cwd);
 }
 
 fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -905,6 +966,8 @@ fn runDaemon(
     sock: []const u8,
     listen_fd: posix.fd_t,
     argv: []const []const u8,
+    state_dir: []const u8,
+    cwd: ?[]const u8,
 ) noreturn {
     _ = posix.setsid() catch {};
 
@@ -931,6 +994,8 @@ fn runDaemon(
         .socket_path = sock,
         .listen_fd = listen_fd,
         .argv = argv,
+        .state_dir = state_dir,
+        .cwd = cwd,
     }) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);

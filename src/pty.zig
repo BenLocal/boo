@@ -93,6 +93,10 @@ pub const SpawnOptions = struct {
     argv: []const []const u8,
     env: *std.process.EnvMap,
     size: Winsize,
+    /// Starting directory for the child. Null inherits the daemon's cwd
+    /// (the directory `boo new` ran in); `boo restore` sets it to the
+    /// session's saved directory.
+    cwd: ?[]const u8 = null,
 };
 
 pub const Spawned = struct {
@@ -117,6 +121,7 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
     defer arena.deinit();
     for (opts.argv, 0..) |arg, i| argv[i] = try arena.allocator().dupeZ(u8, arg);
     const envp = try std.process.createEnvironFromMap(arena.allocator(), opts.env, .{});
+    const cwdz: ?[:0]const u8 = if (opts.cwd) |c| try arena.allocator().dupeZ(u8, c) else null;
 
     const pid = try posix.fork();
     if (pid == 0) {
@@ -130,6 +135,9 @@ pub fn spawnInPty(alloc: std.mem.Allocator, opts: SpawnOptions) !Spawned {
         posix.dup2(pty.slave, 2) catch posix.exit(127);
         if (pty.slave > 2) posix.close(pty.slave);
         posix.close(pty.master);
+
+        // Best effort: a missing saved dir leaves the inherited cwd.
+        if (cwdz) |c| posix.chdirZ(c) catch {};
 
         const err = posix.execvpeZ(argv0, argv, envp);
         _ = err catch {};

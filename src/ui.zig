@@ -1159,12 +1159,15 @@ const Ui = struct {
     mouse_pressed: bool = false,
     mouse_last_cell: ?vt.Coordinate = null,
 
-    /// Viewport text selection in viewport cell coordinates, used
-    /// when the focused application has not requested mouse
-    /// reporting. Anchor is where the drag started; head follows the
-    /// pointer. Both ends are inclusive.
-    select_anchor: ?CellPos = null,
-    select_head: CellPos = .{ .x = 0, .y = 0 },
+    /// Viewport text selection, anchored to terminal content via tracked
+    /// pins so it follows the text as live output scrolls (instead of
+    /// staying on fixed screen rows). Both ends are inclusive. Anchor is
+    /// where the drag started; head follows the pointer. `select_screen`
+    /// is the screen the pins live in (a stable pointer across alt-screen
+    /// switches), used to untrack them safely.
+    select_anchor: ?*vt.Pin = null,
+    select_head: ?*vt.Pin = null,
+    select_screen: ?*vt.Screen = null,
 
     /// Incremented on every attach; detects view switches that happen
     /// between poll() and the socket read.
@@ -1176,9 +1179,8 @@ const Ui = struct {
     /// repeating into the shell would log the user out.
     eof_guard: bool = false,
 
-    const CellPos = struct { x: u16, y: u16 };
-
     fn deinit(self: *Ui) void {
+        self.clearSelection();
         if (self.view) |v| v.destroy();
         freeEntries(self.alloc, &self.sessions);
         if (self.last_name) |n| self.alloc.free(n);
@@ -1720,12 +1722,7 @@ const Ui = struct {
                 const v = self.liveView() orelse return;
                 if (v.term.flags.mouse_event != .none) return self.forwardMouse(m);
                 if (m.release or m.isMotion() or m.code & 3 != 0) return;
-                self.select_anchor = .{
-                    .x = @min(cell.x, v.term.cols -| 1),
-                    .y = @min(cell.y, v.term.rows -| 1),
-                };
-                self.select_head = self.select_anchor.?;
-                self.need_render = true;
+                self.beginSelection(v, cell.x, cell.y);
             },
             .session => |s| {
                 if (m.release or m.isMotion()) return;
@@ -1865,42 +1862,92 @@ const Ui = struct {
         if (encoded.len > 0) v.sendInput(encoded) catch self.markViewLost();
     }
 
-    /// Update an in-progress selection from a drag or release. On
-    /// release the selected text is copied to the clipboard.
-    fn dragSelection(self: *Ui, m: Mouse, x: u16, y: u16) void {
-        const v = self.liveView() orelse {
-            self.select_anchor = null;
+    /// Start a viewport selection at viewport cell (cx, cy). The ends are
+    /// tracked content pins, so the selection follows the text as live
+    /// output scrolls it rather than staying on fixed screen rows.
+    fn beginSelection(self: *Ui, v: *View, cx: u16, cy: u16) void {
+        self.clearSelection();
+        const screen = v.term.screens.active;
+        const p = screen.pages.pin(.{ .viewport = .{
+            .x = @min(cx, v.term.cols -| 1),
+            .y = @min(cy, v.term.rows -| 1),
+        } }) orelse return;
+        const anchor = screen.pages.trackPin(p) catch return;
+        const head = screen.pages.trackPin(p) catch {
+            screen.pages.untrackPin(anchor);
             return;
         };
-        const head: CellPos = .{
-            .x = @min(x, v.term.cols -| 1),
-            .y = @min(y, v.term.rows -| 1),
-        };
-        if (head.x != self.select_head.x or head.y != self.select_head.y) {
-            self.select_head = head;
-            self.need_render = true;
-        }
-        if (!m.release) return;
-
-        const anchor = self.select_anchor.?;
-        if (anchor.x != self.select_head.x or anchor.y != self.select_head.y) {
-            self.copySelection(v);
-        }
-        self.select_anchor = null;
+        self.select_anchor = anchor;
+        self.select_head = head;
+        self.select_screen = screen;
         self.need_render = true;
     }
 
-    /// The selection's inclusive span on viewport row `y`, or null
-    /// when the row is outside the selection.
-    fn selectionSpan(self: *Ui, y: u16, cols: u16) ?struct { x0: u16, x1: u16 } {
-        const anchor = self.select_anchor orelse return null;
+    /// Drop the selection, untracking its pins on the screen they live in
+    /// (a stable pointer across alt-screen switches). Safe with no
+    /// selection, or after the originating view is gone.
+    fn clearSelection(self: *Ui) void {
+        if (self.select_screen) |screen| {
+            // Only untrack while that screen still belongs to a live view;
+            // otherwise its terminal (and the pins) are already freed.
+            const live = if (self.liveView()) |v|
+                v.term.screens.get(.primary) == screen or v.term.screens.get(.alternate) == screen
+            else
+                false;
+            if (live) {
+                if (self.select_anchor) |a| screen.pages.untrackPin(a);
+                if (self.select_head) |h| screen.pages.untrackPin(h);
+            }
+        }
+        self.select_anchor = null;
+        self.select_head = null;
+        self.select_screen = null;
+    }
+
+    /// Update an in-progress selection from a drag or release. On release
+    /// the selected text is copied to the clipboard.
+    fn dragSelection(self: *Ui, m: Mouse, x: u16, y: u16) void {
+        const v = self.liveView() orelse return self.clearSelection();
+        const screen = self.select_screen orelse return;
+        const head_ptr = self.select_head orelse return;
+        // A screen switch (alt screen) during a drag invalidates the
+        // viewport mapping; drop the selection rather than mis-track it.
+        if (screen != v.term.screens.active) return self.clearSelection();
+
+        const p = screen.pages.pin(.{ .viewport = .{
+            .x = @min(x, v.term.cols -| 1),
+            .y = @min(y, v.term.rows -| 1),
+        } }) orelse return;
+        const new_head = screen.pages.trackPin(p) catch return;
+        screen.pages.untrackPin(head_ptr);
+        self.select_head = new_head;
+        self.need_render = true;
+
+        if (!m.release) return;
+        if (self.select_anchor) |a| {
+            const ap = a.*;
+            const hp = new_head.*;
+            if (ap.node != hp.node or ap.x != hp.x or ap.y != hp.y) self.copySelection(v);
+        }
+        self.clearSelection();
+        self.need_render = true;
+    }
+
+    /// The selection's inclusive span on viewport row `y`, or null when
+    /// the row is outside the selection (or the selection lives on a
+    /// screen that is no longer active). Derived from the tracked pins,
+    /// so it tracks the content as it scrolls.
+    fn selectionSpan(self: *Ui, v: *View, y: u16, cols: u16) ?struct { x0: u16, x1: u16 } {
         if (cols == 0) return null;
-        var s = anchor;
-        var e = self.select_head;
-        if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
-        if (y < s.y or y > e.y) return null;
-        const x0: u16 = if (y == s.y) @min(s.x, cols - 1) else 0;
-        const x1: u16 = if (y == e.y) @min(e.x, cols - 1) else cols - 1;
+        const a = self.select_anchor orelse return null;
+        const h = self.select_head orelse return null;
+        const screen = self.select_screen orelse return null;
+        if (screen != v.term.screens.active) return null;
+        const sel = vt.Selection.init(a.*, h.*, false);
+        const row_pin = screen.pages.pin(.{ .viewport = .{ .x = 0, .y = y } }) orelse return null;
+        const row_sel = sel.containedRow(screen, row_pin) orelse return null;
+        const x0 = @min(row_sel.topLeft(screen).x, cols - 1);
+        const x1 = @min(row_sel.bottomRight(screen).x, cols - 1);
         if (x0 > x1) return null;
         return .{ .x0 = x0, .x1 = x1 };
     }
@@ -1908,18 +1955,15 @@ const Ui = struct {
     /// Copy the selected viewport text to the clipboard via OSC 52,
     /// which works over SSH and through nested multiplexers.
     fn copySelection(self: *Ui, v: *View) void {
+        _ = v;
         const alloc = self.alloc;
 
-        var s = self.select_anchor.?;
-        var e = self.select_head;
-        if (e.y < s.y or (e.y == s.y and e.x < s.x)) std.mem.swap(CellPos, &s, &e);
-
-        const screen = v.term.screens.active;
-        const start = screen.pages.pin(.{ .viewport = .{ .x = s.x, .y = s.y } }) orelse return;
-        const end = screen.pages.pin(.{ .viewport = .{ .x = e.x, .y = e.y } }) orelse return;
+        const a = self.select_anchor orelse return;
+        const h = self.select_head orelse return;
+        const screen = self.select_screen orelse return;
 
         var formatter: vt.formatter.ScreenFormatter = .init(screen, .plain);
-        formatter.content = .{ .selection = vt.Selection.init(start, end, false) };
+        formatter.content = .{ .selection = vt.Selection.init(a.*, h.*, false) };
 
         var aw: std.Io.Writer.Allocating = .init(alloc);
         defer aw.deinit();
@@ -2164,6 +2208,9 @@ const Ui = struct {
         const idx = self.selected orelse return;
         const name = self.sessions.items[idx].name;
 
+        // Untrack the selection's pins while the old view's terminal is
+        // still alive, before it is destroyed below.
+        self.clearSelection();
         if (self.view) |v| {
             v.destroy();
             self.view = null;
@@ -2183,7 +2230,6 @@ const Ui = struct {
             return;
         };
         self.view_name = self.alloc.dupe(u8, name) catch null;
-        self.select_anchor = null;
         // Any attach ends an in-progress browse: the selection and
         // the focused session are one again.
         self.browsing = false;
@@ -2410,17 +2456,17 @@ const Ui = struct {
     }
 
     /// The viewport geometry changed: resize the live view (and the
-    /// session pty behind it) and repaint every row. Cell coordinates
-    /// shift with the layout, so any in-progress selection no longer
-    /// points at the text the user dragged over.
+    /// session pty behind it) and repaint every row. A reflow can move
+    /// the selection's tracked pins; drop the selection rather than chase
+    /// the ambiguity.
     fn viewportChanged(self: *Ui) void {
         self.need_render = true;
+        self.clearSelection();
         if (self.view) |v| {
             v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
                 log.warn("viewport resize failed: {}", .{err});
             };
         }
-        self.select_anchor = null;
         self.full_render = true;
     }
 
@@ -2999,7 +3045,7 @@ const Ui = struct {
 
         // An in-progress mouse selection is highlighted by repainting
         // the selected cells in reverse video over the row content.
-        if (self.selectionSpan(y, v.term.cols)) |span| {
+        if (self.selectionSpan(v, y, v.term.cols)) |span| {
             try out.print(alloc, "\x1b[{d};{d}H", .{
                 y + 1,
                 self.layout.viewportX() + span.x0 + 1,
@@ -3948,6 +3994,45 @@ test "ui: the separator thickens while a divider drag is active" {
     ui.divider_drag = true;
     try ui.composeRow(0, &out);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "\u{2503}") != null);
+}
+
+test "ui: a viewport selection follows the content as it scrolls" {
+    const alloc = std.testing.allocator;
+
+    var view: View = .{
+        .alloc = alloc,
+        .sock = -1,
+        .decoder = .init(alloc),
+        .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 64 * 1024 }),
+        .stream = undefined,
+    };
+    defer view.decoder.deinit();
+    defer view.term.deinit(alloc);
+    var feed = view.term.vtStream();
+    defer feed.deinit();
+
+    // Fill the 5-row screen: L1..L5. "L3" sits on viewport row 2.
+    feed.nextSlice("L1\r\nL2\r\nL3\r\nL4\r\nL5");
+
+    var ui: Ui = .{ .alloc = alloc, .dir = "", .tty = -1 };
+    defer ui.sessions.deinit(alloc);
+    ui.view = &view;
+    ui.layout = .{ .rows = 5, .cols = 40, .sidebar_w = 12 };
+
+    // Select the two cells of "L3" on viewport row 2.
+    ui.beginSelection(&view, 0, 2);
+    ui.dragSelection(.{ .code = 32, .x = 0, .y = 0, .release = false }, 1, 2);
+    try std.testing.expect(ui.selectionSpan(&view, 2, view.term.cols) != null);
+    try std.testing.expect(ui.selectionSpan(&view, 0, view.term.cols) == null);
+
+    // Stream two more lines; "L3" scrolls from viewport row 2 up to row 0.
+    feed.nextSlice("\r\nL6\r\nL7");
+
+    // The selection tracked the content: the highlight is now on row 0.
+    try std.testing.expect(ui.selectionSpan(&view, 0, view.term.cols) != null);
+    try std.testing.expect(ui.selectionSpan(&view, 2, view.term.cols) == null);
+
+    ui.clearSelection();
 }
 
 test "layout: hidden sidebar gives the viewport every column" {

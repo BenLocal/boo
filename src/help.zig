@@ -265,6 +265,25 @@ pub const commands = [_]Entry{
         ,
     },
     .{
+        .name = "restore",
+        .body =
+        \\usage: boo restore [name]
+        \\
+        \\Re-create killed sessions in their last working directory. The
+        \\daemon periodically snapshots each session's cwd; the running
+        \\process itself cannot be brought back, so a fresh $SHELL is
+        \\started in the saved directory.
+        \\
+        \\With a name, restores just that session; with none, every
+        \\session that has a saved snapshot but is no longer running.
+        \\
+        \\examples:
+        \\  boo restore work
+        \\  boo restore
+        \\
+        ,
+    },
+    .{
         .name = "rename",
         .body =
         \\usage: boo rename <name> <new-name>

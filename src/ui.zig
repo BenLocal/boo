@@ -770,12 +770,20 @@ pub const View = struct {
     }
 
     pub fn resize(self: *View, rows: u16, cols: u16) !void {
-        try self.term.resize(self.alloc, @max(cols, 1), @max(rows, 1));
+        try self.resizeLocal(rows, cols);
         if (self.state != .live) return;
         try protocol.writeMsg(self.sock, .resize, &(protocol.SizePayload{
             .rows = @max(rows, 1),
             .cols = @max(cols, 1),
         }).encode());
+    }
+
+    /// Reflow only the local terminal, without telling the daemon. Used
+    /// for live feedback while dragging the divider so the session app is
+    /// not SIGWINCH-stormed; the final size is committed with resize() on
+    /// release.
+    pub fn resizeLocal(self: *View, rows: u16, cols: u16) !void {
+        try self.term.resize(self.alloc, @max(cols, 1), @max(rows, 1));
     }
 };
 
@@ -1295,7 +1303,7 @@ const Ui = struct {
         if (self.sidebar_pref) |w| {
             self.layout.sidebar_w = self.clampSidebarWidth(w);
         }
-        self.viewportChanged();
+        self.viewportChanged(true);
     }
 
     // -- Terminal input ------------------------------------------------------
@@ -1668,18 +1676,20 @@ const Ui = struct {
             return self.dragSelection(m, x -| self.layout.viewportX(), y);
         }
 
-        // An in-progress divider drag follows the cursor column,
-        // resizing the sidebar live; the release commits the width so a
-        // later terminal resize keeps it.
+        // An in-progress divider drag follows the cursor column. Each step
+        // only reflows the local terminal (cheap, no SIGWINCH); the daemon
+        // is told the final size once on release, so the session app is not
+        // resize-stormed into a garbled redraw.
         if (self.divider_drag and !m.isWheel() and (m.isMotion() or m.release)) {
             if (m.release) {
                 self.divider_drag = false;
                 self.sidebar_pref = self.layout.sidebar_w;
+                self.viewportChanged(true); // commit the final size to the daemon
                 // Repaint so the separator drops back to the light line.
                 self.full_render = true;
                 self.need_render = true;
             } else {
-                self.applySidebarWidth(x);
+                self.applySidebarWidth(x, false);
             }
             return;
         }
@@ -2389,7 +2399,7 @@ const Ui = struct {
             self.message.clearRetainingCapacity();
             self.message_deadline = 0;
         }
-        self.applySidebarWidth(@as(i32, self.layout.sidebar_w) + dir);
+        self.applySidebarWidth(@as(i32, self.layout.sidebar_w) + dir, true);
     }
 
     /// Enter/Esc handling while the sidebar resize is active: Enter
@@ -2431,18 +2441,18 @@ const Ui = struct {
     /// arrow, mirroring how a cancelled browse restores its origin.
     fn cancelResize(self: *Ui) void {
         self.resizing = false;
-        self.applySidebarWidth(self.resize_origin);
+        self.applySidebarWidth(self.resize_origin, true);
     }
 
     /// Clamp and apply a sidebar width. The viewport shifts with it,
     /// so the live view (and the session pty behind it) resizes and
     /// every row repaints.
-    fn applySidebarWidth(self: *Ui, want: i32) void {
+    fn applySidebarWidth(self: *Ui, want: i32, commit: bool) void {
         const w = self.clampSidebarWidth(want);
         self.need_render = true;
         if (w == self.layout.sidebar_w) return;
         self.layout.sidebar_w = w;
-        self.viewportChanged();
+        self.viewportChanged(commit);
     }
 
     /// Show or hide the sidebar: C-a s. The viewport takes the full
@@ -2452,18 +2462,24 @@ const Ui = struct {
     fn toggleSidebar(self: *Ui) void {
         if (!self.layout.hidden and self.browsing) self.cancelBrowse();
         self.layout.hidden = !self.layout.hidden;
-        self.viewportChanged();
+        self.viewportChanged(true);
     }
 
     /// The viewport geometry changed: resize the live view (and the
     /// session pty behind it) and repaint every row. A reflow can move
     /// the selection's tracked pins; drop the selection rather than chase
     /// the ambiguity.
-    fn viewportChanged(self: *Ui) void {
+    /// `commit` tells the daemon (and thus the session app) about the new
+    /// size; pass false to only reflow the local terminal, e.g. on each
+    /// step of a divider drag, deferring the single daemon resize to the
+    /// drag's release.
+    fn viewportChanged(self: *Ui, commit: bool) void {
         self.need_render = true;
         self.clearSelection();
         if (self.view) |v| {
-            v.resize(self.layout.viewportRows(), self.layout.viewportCols()) catch |err| {
+            const rows = self.layout.viewportRows();
+            const cols = self.layout.viewportCols();
+            (if (commit) v.resize(rows, cols) else v.resizeLocal(rows, cols)) catch |err| {
                 log.warn("viewport resize failed: {}", .{err});
             };
         }

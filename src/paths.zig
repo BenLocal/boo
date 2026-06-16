@@ -92,7 +92,8 @@ pub fn statePath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![
 }
 
 /// Names of sessions with a saved snapshot but no live socket: the
-/// killed/dead sessions that `boo restore` can bring back. Snapshots
+/// sessions whose daemon died without cleaning up (a crash or reboot)
+/// that `boo restore` can bring back. Snapshots
 /// (`<name>.state`) live in `state_dir`; live sockets (`<name>.sock`) in
 /// `socket_dir`, which may be a different directory. Caller frees each
 /// name and the list.

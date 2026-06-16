@@ -402,44 +402,30 @@ test "detached session: send and peek round-trip through libghostty" {
     defer alloc.free(content);
 }
 
-test "restore: a killed session comes back in its saved directory" {
+test "restore: an orphaned snapshot is brought back in its saved directory" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    // A directory for the session's shell to run in.
+    // A directory for the restored session's shell to run in.
     const work = try std.fs.path.join(alloc, &.{ h.dir, "work" });
     defer alloc.free(work);
     try std.fs.cwd().makePath(work);
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = try std.fs.cwd().realpath(work, &real_buf);
 
-    // Create session 'r' with a fresh shell started in `work`.
-    {
-        const res = try h.runIn(work, &.{ "new", "r", "-d" });
-        defer alloc.free(res.stdout);
-        defer alloc.free(res.stderr);
-        try std.testing.expect(res.term == .Exited and res.term.Exited == 0);
-    }
-    try h.waitSessionUp("r");
-
-    // The daemon snapshots the working directory to <config>/r.state.
-    const state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "r.state" });
+    // A snapshot left behind by a daemon that died without cleaning up
+    // (a crash, a SIGKILL, or a reboot): a <name>.state in the config
+    // dir with no live socket. That orphan is the only thing `boo
+    // restore` revives — a session ended on purpose drops its snapshot.
+    const boo_dir = try std.fs.path.join(alloc, &.{ h.dir, "boo" });
+    defer alloc.free(boo_dir);
+    try std.fs.cwd().makePath(boo_dir);
+    const state = try std.fs.path.join(alloc, &.{ boo_dir, "r.state" });
     defer alloc.free(state);
-    const expected = try std.fmt.allocPrint(alloc, "{s}\n", .{real});
-    defer alloc.free(expected);
-    try waitFileEquals(alloc, state, expected);
-
-    // Kill it; the snapshot must survive so it can be restored.
-    try h.runOk(&.{ "kill", "r" });
-    const sock = try std.fs.path.join(alloc, &.{ h.dir, "r.sock" });
-    defer alloc.free(sock);
-    var deadline = Deadline.init(default_timeout_ms);
-    while (true) {
-        std.fs.cwd().access(sock, .{}) catch break; // socket gone == daemon exited
-        try deadline.tick("socket not removed after kill");
-    }
-    try std.fs.cwd().access(state, .{}); // snapshot still present
+    const snap = try std.fmt.allocPrint(alloc, "{s}\n", .{real});
+    defer alloc.free(snap);
+    try std.fs.cwd().writeFile(.{ .sub_path = state, .data = snap });
 
     // Restore re-creates the session; its shell is in the saved directory.
     try h.runOk(&.{ "restore", "r" });
@@ -447,6 +433,33 @@ test "restore: a killed session comes back in its saved directory" {
     try h.sendLine("r", "pwd");
     const peek = try h.waitPeekContains("r", real);
     defer alloc.free(peek);
+}
+
+test "restore: an explicit kill drops the snapshot" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // cat waits for stdin; the daemon snapshots its cwd at startup.
+    try h.startDetached("k", &.{"cat"});
+    const state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "k.state" });
+    defer alloc.free(state);
+
+    // Wait for the snapshot to be written.
+    var d1 = Deadline.init(default_timeout_ms);
+    while (std.fs.cwd().access(state, .{})) |_| break else |_| {
+        try d1.tick("snapshot never written");
+    }
+
+    // An explicit kill ends the session on purpose, so its snapshot is
+    // removed: the session must not be restorable afterwards.
+    try h.runOk(&.{ "kill", "k" });
+    var d2 = Deadline.init(default_timeout_ms);
+    while (true) {
+        std.fs.cwd().access(state, .{}) catch break; // gone
+        try d2.tick("snapshot not removed on kill");
+    }
+    try h.runExit(&.{ "restore", "k" }, 3);
 }
 
 test "restore: a clean command exit drops the snapshot" {
@@ -1360,6 +1373,40 @@ test "rename: moves a session to a new name" {
     try h.runExit(&.{ "rename", "nosuchzz", "x" }, 3);
     try h.runExit(&.{"rename"}, 2);
     try h.runExit(&.{ "rename", "after" }, 2);
+}
+
+test "rename: the restore snapshot follows the new name, leaving no ghost" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("before", &.{"cat"});
+
+    // Wait for the daemon's first snapshot under the old name.
+    const before_state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "before.state" });
+    defer alloc.free(before_state);
+    var d1 = Deadline.init(default_timeout_ms);
+    while (std.fs.cwd().access(before_state, .{})) |_| break else |_| {
+        try d1.tick("snapshot never written");
+    }
+
+    try h.runOk(&.{ "rename", "before", "after" });
+
+    // The snapshot moves with the session: <old>.state disappears and
+    // <new>.state appears. A leftover before.state would make `boo
+    // restore` resurrect a ghost named 'before'.
+    const after_state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "after.state" });
+    defer alloc.free(after_state);
+    var d2 = Deadline.init(default_timeout_ms);
+    while (true) {
+        std.fs.cwd().access(before_state, .{}) catch break; // old snapshot gone
+        try d2.tick("stale snapshot left under the old name");
+    }
+    try std.fs.cwd().access(after_state, .{}); // new snapshot present
+
+    // Kill the session; only 'after' is restorable, never the old name.
+    try h.runOk(&.{ "kill", "after" });
+    try h.runExit(&.{ "restore", "before" }, 3);
 }
 
 // -- boo ui -------------------------------------------------------------------

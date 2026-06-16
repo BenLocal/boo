@@ -83,6 +83,9 @@ const Harness = struct {
         var env = try std.process.getEnvMap(self.alloc);
         defer env.deinit();
         try env.put("BOO_DIR", self.dir);
+        // Restore snapshots land in the config dir; isolate it under the
+        // harness temp dir so they go to <dir>/boo/ instead of ~/.config.
+        try env.put("XDG_CONFIG_HOME", self.dir);
 
         return std.process.Child.run(.{
             .allocator = self.alloc,
@@ -259,6 +262,7 @@ const PtyClient = struct {
 
         var env = try std.process.getEnvMap(arena);
         try env.put("BOO_DIR", harness.dir);
+        try env.put("XDG_CONFIG_HOME", harness.dir);
         const envp = try std.process.createEnvironFromMap(arena, &env, .{});
 
         const pid = try posix.fork();
@@ -419,8 +423,8 @@ test "restore: a killed session comes back in its saved directory" {
     }
     try h.waitSessionUp("r");
 
-    // The daemon snapshots the working directory to <dir>/r.state.
-    const state = try std.fs.path.join(alloc, &.{ h.dir, "r.state" });
+    // The daemon snapshots the working directory to <config>/r.state.
+    const state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "r.state" });
     defer alloc.free(state);
     const expected = try std.fmt.allocPrint(alloc, "{s}\n", .{real});
     defer alloc.free(expected);
@@ -452,7 +456,7 @@ test "restore: a clean command exit drops the snapshot" {
 
     // cat waits for stdin; the daemon snapshots its cwd at startup.
     try h.startDetached("c", &.{"cat"});
-    const state = try std.fs.path.join(alloc, &.{ h.dir, "c.state" });
+    const state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "c.state" });
     defer alloc.free(state);
 
     // Wait for the snapshot to be written.

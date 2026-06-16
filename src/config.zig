@@ -95,6 +95,29 @@ pub const Config = struct {
     }
 };
 
+/// Directory that holds the config file, where session restore snapshots
+/// (`<name>.state`) also live so they survive a reboot (unlike the socket
+/// dir under /tmp). Mirrors `load`'s search: the directory of $BOO_CONFIG,
+/// else $XDG_CONFIG_HOME/boo, else $HOME/.config/boo. Created if missing;
+/// null when none of those env vars is set. Caller frees.
+pub fn configDir(alloc: std.mem.Allocator) !?[]u8 {
+    const dir: []u8 = blk: {
+        if (envNonEmpty("BOO_CONFIG")) |path| {
+            break :blk try alloc.dupe(u8, std.fs.path.dirname(path) orelse ".");
+        }
+        if (envNonEmpty("XDG_CONFIG_HOME")) |base| {
+            break :blk try std.fs.path.join(alloc, &.{ base, "boo" });
+        }
+        if (envNonEmpty("HOME")) |home| {
+            break :blk try std.fs.path.join(alloc, &.{ home, ".config", "boo" });
+        }
+        return null;
+    };
+    errdefer alloc.free(dir);
+    try std.fs.cwd().makePath(dir);
+    return dir;
+}
+
 fn envNonEmpty(name: []const u8) ?[]const u8 {
     const v = std.posix.getenv(name) orelse return null;
     return if (v.len == 0) null else v;

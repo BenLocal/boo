@@ -92,30 +92,46 @@ pub fn statePath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![
 }
 
 /// Names of sessions with a saved snapshot but no live socket: the
-/// killed/dead sessions that `boo restore` can bring back. Caller frees
-/// each name and the list.
-pub fn restorableSessions(alloc: std.mem.Allocator, dir_path: []const u8) ![][]u8 {
+/// killed/dead sessions that `boo restore` can bring back. Snapshots
+/// (`<name>.state`) live in `state_dir`; live sockets (`<name>.sock`) in
+/// `socket_dir`, which may be a different directory. Caller frees each
+/// name and the list.
+pub fn restorableSessions(
+    alloc: std.mem.Allocator,
+    state_dir: []const u8,
+    socket_dir: []const u8,
+) ![][]u8 {
     var names: std.ArrayList([]u8) = .empty;
     errdefer {
         for (names.items) |n| alloc.free(n);
         names.deinit(alloc);
     }
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+    var sdir = std.fs.cwd().openDir(state_dir, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return names.toOwnedSlice(alloc),
         else => return err,
     };
-    defer dir.close();
+    defer sdir.close();
 
-    var it = dir.iterate();
+    // The socket dir may not exist yet (nothing started this boot); treat
+    // its absence as "no live sessions".
+    var sockdir: ?std.fs.Dir = std.fs.cwd().openDir(socket_dir, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (sockdir) |*d| d.close();
+
+    var it = sdir.iterate();
     while (try it.next()) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".state")) continue;
         const name = entry.name[0 .. entry.name.len - ".state".len];
         validateName(name) catch continue;
         // Skip sessions that are still running (a live socket exists).
-        const sock = std.fmt.allocPrint(alloc, "{s}.sock", .{name}) catch continue;
-        defer alloc.free(sock);
-        if (dir.access(sock, .{})) |_| continue else |_| {}
+        if (sockdir) |sd| {
+            const sock = std.fmt.allocPrint(alloc, "{s}.sock", .{name}) catch continue;
+            defer alloc.free(sock);
+            if (sd.access(sock, .{})) |_| continue else |_| {}
+        }
         try names.append(alloc, try alloc.dupe(u8, name));
     }
 
@@ -231,20 +247,30 @@ test "restorableSessions lists snapshots without a live socket" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const base = try tmp.dir.realpathAlloc(alloc, ".");
-    defer alloc.free(base);
+    // Snapshots and sockets live in separate directories.
+    try tmp.dir.makePath("state");
+    try tmp.dir.makePath("sock");
+    const state = try tmp.dir.realpathAlloc(alloc, "state");
+    defer alloc.free(state);
+    const sock = try tmp.dir.realpathAlloc(alloc, "sock");
+    defer alloc.free(sock);
+
+    var sdir = try tmp.dir.openDir("state", .{});
+    defer sdir.close();
+    var kdir = try tmp.dir.openDir("sock", .{});
+    defer kdir.close();
 
     // dead: a snapshot with no socket -> restorable.
-    try tmp.dir.writeFile(.{ .sub_path = "dead.state", .data = "/home/u\n" });
-    // live: a snapshot with a socket -> still running, skip.
-    try tmp.dir.writeFile(.{ .sub_path = "live.state", .data = "/tmp\n" });
-    try tmp.dir.writeFile(.{ .sub_path = "live.sock", .data = "" });
+    try sdir.writeFile(.{ .sub_path = "dead.state", .data = "/home/u\n" });
+    // live: a snapshot with a socket in the other dir -> still running, skip.
+    try sdir.writeFile(.{ .sub_path = "live.state", .data = "/tmp\n" });
+    try kdir.writeFile(.{ .sub_path = "live.sock", .data = "" });
     // a bare socket with no snapshot is not restorable either.
-    try tmp.dir.writeFile(.{ .sub_path = "running.sock", .data = "" });
+    try kdir.writeFile(.{ .sub_path = "running.sock", .data = "" });
     // an invalid name is ignored.
-    try tmp.dir.writeFile(.{ .sub_path = ".hidden.state", .data = "/x" });
+    try sdir.writeFile(.{ .sub_path = ".hidden.state", .data = "/x" });
 
-    const names = try restorableSessions(alloc, base);
+    const names = try restorableSessions(alloc, state, sock);
     defer {
         for (names) |n| alloc.free(n);
         alloc.free(names);

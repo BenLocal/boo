@@ -284,6 +284,11 @@ fn createSession(
     const max_scrollback = cfg.max_scrollback;
     cfg.deinit(alloc);
 
+    // Restore snapshots live in the config dir so they survive a reboot
+    // (the socket dir under /tmp does not). Null disables snapshots.
+    const state_dir = config.configDir(alloc) catch null;
+    defer if (state_dir) |s| alloc.free(s);
+
     const sock = try paths.socketPath(alloc, dir, name);
     defer alloc.free(sock);
 
@@ -306,7 +311,7 @@ fn createSession(
             .socket_path = sock,
             .listen_fd = listen_fd,
             .argv = cmd_argv,
-            .state_dir = dir,
+            .state_dir = state_dir,
             .cwd = cwd,
             .max_scrollback = max_scrollback,
         });
@@ -314,7 +319,7 @@ fn createSession(
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv, dir, cwd, max_scrollback);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv, state_dir, cwd, max_scrollback);
     }
     posix.close(listen_fd);
 
@@ -340,9 +345,14 @@ fn cmdRestore(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
+    // Snapshots live in the config dir, sockets in the runtime dir.
+    const state_dir = config.configDir(alloc) catch null;
+    defer if (state_dir) |s| alloc.free(s);
 
     if (name_arg) |want| {
-        restoreOne(alloc, dir, want) catch |err| switch (err) {
+        const sdir = state_dir orelse
+            fail(exit_no_session, "no snapshot for session '{s}' (run 'boo ls')", .{want});
+        restoreOne(alloc, dir, sdir, want) catch |err| switch (err) {
             error.AlreadyRunning => fail(exit_runtime, "session {s} is already running", .{want}),
             error.NoSnapshot => fail(exit_no_session, "no snapshot for session '{s}' (run 'boo ls')", .{want}),
             else => return err,
@@ -350,26 +360,32 @@ fn cmdRestore(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
         return;
     }
 
-    const names = try paths.restorableSessions(alloc, dir);
+    const sdir = state_dir orelse return stdoutWrite("nothing to restore\n");
+    const names = try paths.restorableSessions(alloc, sdir, dir);
     defer {
         for (names) |n| alloc.free(n);
         alloc.free(names);
     }
     if (names.len == 0) return stdoutWrite("nothing to restore\n");
-    for (names) |n| restoreOne(alloc, dir, n) catch |err| {
+    for (names) |n| restoreOne(alloc, dir, sdir, n) catch |err| {
         std.debug.print("boo: restore {s} failed: {s}\n", .{ n, @errorName(err) });
     };
 }
 
-fn restoreOne(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void {
+fn restoreOne(
+    alloc: std.mem.Allocator,
+    socket_dir: []const u8,
+    state_dir: []const u8,
+    name: []const u8,
+) !void {
     paths.validateName(name) catch usageFail("restore", "invalid session name '{s}'", .{name});
 
     // A live socket means the session is still running.
-    const sock = try paths.socketPath(alloc, dir, name);
+    const sock = try paths.socketPath(alloc, socket_dir, name);
     defer alloc.free(sock);
     if (std.fs.cwd().access(sock, .{})) |_| return error.AlreadyRunning else |_| {}
 
-    const state = try paths.statePath(alloc, dir, name);
+    const state = try paths.statePath(alloc, state_dir, name);
     defer alloc.free(state);
     const raw = std.fs.cwd().readFileAlloc(alloc, state, 64 * 1024) catch |err| switch (err) {
         error.FileNotFound => return error.NoSnapshot,
@@ -380,7 +396,7 @@ fn restoreOne(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) !void
     const cwd: ?[]const u8 = if (saved.len > 0) saved else null;
 
     // Detached, fresh shell ($SHELL), started in the saved directory.
-    try createSession(alloc, dir, name, true, &.{}, cwd);
+    try createSession(alloc, socket_dir, name, true, &.{}, cwd);
 }
 
 fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -979,7 +995,7 @@ fn runDaemon(
     sock: []const u8,
     listen_fd: posix.fd_t,
     argv: []const []const u8,
-    state_dir: []const u8,
+    state_dir: ?[]const u8,
     cwd: ?[]const u8,
     max_scrollback: usize,
 ) noreturn {

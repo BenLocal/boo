@@ -185,6 +185,7 @@ pub const Window = struct {
     }
 
     pub fn resize(self: *Window, rows: u16, cols: u16) !void {
+        if (rows == self.term.rows and cols == self.term.cols) return;
         try self.term.resize(self.alloc, cols, rows);
         if (self.pty_fd >= 0) {
             try ptypkg.Pty.setSize(self.pty_fd, ptypkg.makeWinsize(rows, cols));
@@ -551,6 +552,40 @@ test "historyReplay returns null without scrollback" {
     // Two lines, nothing scrolled off: no history.
     stream.nextSlice("hello\r\nworld");
     try std.testing.expect((try win.historyReplay(alloc)) == null);
+}
+
+test "historyReplay does not replay the alternate screen" {
+    // A full-screen TUI (claude, vim, ...) runs on the alternate screen,
+    // which has no scrollback. historyReplay must produce nothing there;
+    // otherwise the replayed content stacks on top of the repaint and the
+    // user sees duplicated history — worse on every re-attach.
+    const alloc = std.testing.allocator;
+    var win: Window = .{
+        .alloc = alloc,
+        .pty_fd = -1,
+        .child_pid = -1,
+        .command_title = "test",
+        .last_output_ms = 0,
+        .term = try vt.Terminal.init(alloc, .{ .cols = 20, .rows = 5, .max_scrollback = 512 * 1024 }),
+        .stream = undefined,
+    };
+    defer win.term.deinit(alloc);
+    var stream = win.term.vtStream();
+    defer stream.deinit();
+
+    // Primary-screen scrollback, then enter the alt screen and draw.
+    stream.nextSlice("P1\r\nP2\r\nP3\r\nP4\r\nP5\r\nP6\r\nP7\r\nP8");
+    stream.nextSlice("\x1b[?1049h\x1b[2J\x1b[HALT1\r\nALT2\r\nALT3");
+
+    try std.testing.expect(win.onAltScreen());
+    const h = try win.historyReplay(alloc);
+    if (h) |bytes| {
+        defer alloc.free(bytes);
+        // It must at least never leak the primary-screen history into the
+        // alt-screen view (that is the duplication the user reported).
+        try std.testing.expect(std.mem.indexOf(u8, bytes, "P1") == null);
+    }
+    try std.testing.expect(h == null);
 }
 
 test "title set via OSC is tracked and emitted sanitized" {

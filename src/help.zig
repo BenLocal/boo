@@ -52,9 +52,12 @@ pub const overview =
     \\  name (e.g. 'boo attach bu' for "build").
     \\
     \\environment:
-    \\  BOO_DIR  socket directory
-    \\           (default: $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>)
-    \\  BOO_LOG  append daemon logs to this file (debugging)
+    \\  BOO_DIR     socket directory
+    \\              (default: $XDG_RUNTIME_DIR/boo, else /tmp/boo-<uid>)
+    \\  BOO_CONFIG  config file; its directory also holds session
+    \\              restore snapshots (default: $XDG_CONFIG_HOME/boo,
+    \\              else ~/.config/boo)
+    \\  BOO_LOG     append daemon logs to this file (debugging)
     \\
 ;
 

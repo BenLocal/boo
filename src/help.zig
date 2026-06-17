@@ -144,10 +144,11 @@ pub const commands = [_]Entry{
         \\  C-a g   go to a session by name (best match)
         \\  C-a n   focus the next session
         \\  C-a p   focus the previous session
-        \\  C-a Up, C-a Down
+        \\  C-a Up, C-a Down  (or Alt+Up, Alt+Down)
         \\          browse the session list without attaching:
         \\          Up/Down move the selection, Enter attaches it,
-        \\          Esc returns to the focused session
+        \\          Esc returns to the focused session. Alt+Up/Down
+        \\          browse directly, with no C-a prefix.
         \\  C-a Left, C-a Right
         \\          resize the sidebar: Left/Right adjust the width,
         \\          Enter keeps it, Esc restores the previous width

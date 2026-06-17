@@ -2426,6 +2426,75 @@ test "ui: report-events arrows browse after the prefix" {
     try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
 }
 
+test "ui: Alt+Down browses the sidebar (CSI-modifier form)" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+    try h.startDetached("bravo", &.{"cat"});
+    try h.sendLine("bravo", "BRAVO-MARK");
+    const seeded = try h.waitPeekContains("bravo", "BRAVO-MARK");
+    alloc.free(seeded);
+
+    // bravo saw input last, so the UI focuses it on startup.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("BRAVO-MARK");
+
+    // Alt+Down (CSI-modifier form, ESC [ 1 ; 3 B) browses the sidebar
+    // with no C-a prefix: the browse hint arms, exactly like C-a Down.
+    try ui.send("\x1b[1;3B");
+    try ui.waitFor("enter attach");
+
+    // The arrow drove the UI, not bravo: its modifier bytes never
+    // reached the focused session.
+    const peek = try h.run(&.{ "peek", "bravo" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+    try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "1;3B") == null);
+
+    // Enter attaches the browsed selection; the focus switch forces a
+    // full repaint, proven by the normal keybind hint returning.
+    ui.clearOutput();
+    try ui.send("\r");
+    try ui.waitFor("Keybinds: Ctrl+A");
+}
+
+test "ui: Alt+Up browses the sidebar (Meta-escape form)" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("alpha", &.{"cat"});
+    try h.startDetached("bravo", &.{"cat"});
+    try h.sendLine("bravo", "BRAVO-MARK");
+    const seeded = try h.waitPeekContains("bravo", "BRAVO-MARK");
+    alloc.free(seeded);
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("BRAVO-MARK");
+
+    // The other Alt+Up/Down encoding: a Meta ESC ahead of a bare arrow
+    // (ESC ESC [ A), the form some terminals send. It browses just like
+    // the CSI-modifier form, with no C-a prefix.
+    try ui.send("\x1b\x1b[A");
+    try ui.waitFor("enter attach");
+
+    // Neither ESC nor the arrow leaked into bravo.
+    const peek = try h.run(&.{ "peek", "bravo" });
+    defer alloc.free(peek.stdout);
+    defer alloc.free(peek.stderr);
+    try std.testing.expect(peek.term.Exited == 0);
+
+    // Enter attaches the browsed selection, forcing a full repaint.
+    ui.clearOutput();
+    try ui.send("\r");
+    try ui.waitFor("Keybinds: Ctrl+A");
+}
+
 test "ui: enter attaches the selection when nothing is focused" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

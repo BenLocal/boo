@@ -158,8 +158,10 @@ pub const InputEvent = union(enum) {
     forward: []const u8,
     /// Command key following the C-a prefix.
     prefix: u8,
-    /// Plain arrow key (ESC [ A/B/C/D). `prefixed` marks an arrow
-    /// that followed the C-a prefix.
+    /// Plain arrow key (ESC [ A/B/C/D). `prefixed` marks an arrow that
+    /// drives the sidebar browse / divider resize rather than the
+    /// focused application: one that followed the C-a prefix, or an
+    /// Alt+Up/Down browse chord.
     arrow: Arrow,
     mouse: Mouse,
     /// Bracketed paste begin (true) / end (false).
@@ -173,6 +175,9 @@ pub const InputEvent = union(enum) {
 
     pub const Arrow = struct {
         dir: Dir,
+        /// The arrow drives the UI (sidebar browse / divider resize),
+        /// not the focused application: set by the C-a prefix or, for a
+        /// vertical Alt+arrow chord, by the parser itself.
         prefixed: bool,
         /// The original bytes, forwarded verbatim when the arrow is
         /// not intercepted for browse/resize, so a modified arrow or
@@ -222,6 +227,12 @@ pub const InputParser = struct {
     /// it (C-a Up/Down) and an encoded key decodes to the command
     /// key; anything else cancels the prefix as before.
     prefix_held: bool = false,
+    /// A bare ESC was dropped ahead of the held sequence because a
+    /// second ESC followed it: the leading ESC is a Meta (Alt)
+    /// modifier. An inner Up/Down arrow becomes the Alt+Up/Down browse
+    /// chord; any other inner sequence is replayed with the ESC
+    /// restored (see flushHeld).
+    pending_meta: bool = false,
     in_paste: bool = false,
     /// Which encoded-key decodes are active: the real terminal
     /// mirrors the focused application's kitty flags and
@@ -231,6 +242,9 @@ pub const InputParser = struct {
     prot: keys.Protocols = .{},
 
     const hold_max = 40;
+    /// The Alt bit in a cursor-key modifier mask (caps/num lock
+    /// removed): ESC [ 1 ; 3 A is Alt+Up.
+    const alt_modifier: u32 = 0x2;
 
     /// Process a chunk of input. Calls handler.event for every parsed
     /// event, including .forward runs of passthrough bytes. The
@@ -255,6 +269,19 @@ pub const InputParser = struct {
                     start = i;
                     if (isCsiFinal(byte)) try self.finishCsi(handler);
                     if (self.held_len == hold_max) try self.flushHeld(handler);
+                } else if (self.held_len == 1 and self.held[0] == 0x1b and
+                    byte == 0x1b and !self.in_paste and !self.pending_meta)
+                {
+                    // ESC ESC … : the leading ESC is a Meta (Alt)
+                    // modifier on the sequence that follows, the form
+                    // some terminals send for Alt+Up/Down. Drop it and
+                    // restart the hold on the inner ESC (already in the
+                    // buffer), remembering the modifier so an inner
+                    // Up/Down arrow browses the sidebar. finishCsi or
+                    // flushHeld consults pending_meta from here.
+                    self.pending_meta = true;
+                    i += 1;
+                    start = i;
                 } else {
                     try self.flushHeld(handler);
                 }
@@ -367,19 +394,45 @@ pub const InputParser = struct {
         // are the application's input and replay verbatim.
         switch (final) {
             'A', 'B', 'C', 'D' => {
-                if (body.len == 0 or arrowNavigates(body)) {
+                const dir: InputEvent.Arrow.Dir = switch (final) {
+                    'A' => .up,
+                    'B' => .down,
+                    'C' => .right,
+                    else => .left,
+                };
+                // Alt+Up/Down is a standalone sidebar-browse chord, the
+                // same motion as C-a Up/Down without the prefix. It
+                // arrives in two encodings: the CSI-modifier form
+                // (ESC [ 1 ; 3 A) and the Meta-escape form (ESC ESC [ A,
+                // flagged by pending_meta in the feed loop). Either way
+                // a vertical Alt arrow browses; Alt side arrows and
+                // every other modifier keep their meaning.
+                const alt = self.pending_meta or arrowModifiers(body) == alt_modifier;
+                if (alt and (dir == .up or dir == .down)) {
+                    self.pending_meta = false;
                     self.held_len = 0;
                     return handler.event(.{ .arrow = .{
-                        .dir = switch (final) {
-                            'A' => .up,
-                            'B' => .down,
-                            'C' => .right,
-                            else => .left,
-                        },
+                        .dir = dir,
+                        .prefixed = true,
+                        .seq = seq,
+                    } });
+                }
+                // A bare ESC [ A/B/C/D, or the functional form's
+                // unmodified press/repeat, drives the C-a-prefixed
+                // browse/resize. Never reached under a Meta prefix: a
+                // Meta-escape arrow is Alt by construction, so it either
+                // browsed above or replays verbatim below.
+                if (!self.pending_meta and (body.len == 0 or arrowNavigates(body))) {
+                    self.held_len = 0;
+                    return handler.event(.{ .arrow = .{
+                        .dir = dir,
                         .prefixed = prefixed,
                         .seq = seq,
                     } });
                 }
+                // A modified arrow (Ctrl+Left word motion, Alt+Left, a
+                // release) is the application's; flushHeld restores any
+                // dropped Meta ESC and replays it verbatim.
                 return self.flushHeld(handler);
             },
             else => {},
@@ -557,36 +610,54 @@ pub const InputParser = struct {
         return std.fmt.parseInt(u16, text, 10) catch null;
     }
 
-    /// Whether the body of a functional cursor key
-    /// (ESC [ 1 ; mods [: event] A/B/C/D) is an unmodified press or
-    /// repeat, the only forms that drive browse/resize. A modified
-    /// arrow (mods other than none, ignoring lock bits) or a release
-    /// event belongs to the application and replays verbatim. The
-    /// leading parameter is always `1` for these keys.
-    fn arrowNavigates(body: []const u8) bool {
+    /// Modifier mask of a functional cursor key
+    /// (ESC [ 1 ; mods [: event] A/B/C/D) on a press or repeat, with
+    /// the caps/num lock bits removed: 0 unmodified, 0x2 Alt, 0x4 Ctrl.
+    /// Null for a bare body, a release event, or a malformed sequence;
+    /// the bare ESC [ A form (empty body) is treated as unmodified by
+    /// the caller. The leading parameter is always `1` for these keys.
+    fn arrowModifiers(body: []const u8) ?u32 {
         var sections = std.mem.splitScalar(u8, body, ';');
-        const first = sections.next() orelse return false;
-        if (!std.mem.eql(u8, first, "1")) return false;
-        const mods_section = sections.next() orelse return false;
-        if (sections.next() != null) return false;
+        const first = sections.next() orelse return null;
+        if (!std.mem.eql(u8, first, "1")) return null;
+        const mods_section = sections.next() orelse return null;
+        if (sections.next() != null) return null;
         var fields = std.mem.splitScalar(u8, mods_section, ':');
-        const mods_text = fields.next() orelse return false;
-        const mods = std.fmt.parseInt(u32, mods_text, 10) catch return false;
-        // Lock bits (caps/num) do not count as a real modifier.
-        if ((mods -| 1) & 0x3f != 0) return false;
+        const mods_text = fields.next() orelse return null;
+        const mods = std.fmt.parseInt(u32, mods_text, 10) catch return null;
         if (fields.next()) |event_text| {
-            const event = std.fmt.parseInt(u32, event_text, 10) catch return false;
+            const event = std.fmt.parseInt(u32, event_text, 10) catch return null;
             // 1 press, 2 repeat navigate; 3 release does not.
-            if (event != 1 and event != 2) return false;
+            if (event != 1 and event != 2) return null;
         }
-        if (fields.next() != null) return false;
-        return true;
+        if (fields.next() != null) return null;
+        // Lock bits (caps/num) do not count as a real modifier.
+        return (mods -| 1) & 0x3f;
+    }
+
+    /// Whether a functional cursor key is an unmodified press or
+    /// repeat, the only form that drives the C-a-prefixed browse/resize.
+    /// A modified arrow or a release event belongs to the application.
+    fn arrowNavigates(body: []const u8) bool {
+        return (arrowModifiers(body) orelse return false) == 0;
     }
 
     /// Replay held bytes as session input: the sequence is some other
     /// key encoding (function keys, modified arrows, ...) that belongs
     /// to the application.
     fn flushHeld(self: *InputParser, handler: anytype) !void {
+        if (self.pending_meta) {
+            // The held sequence followed a Meta (Alt) ESC that the feed
+            // loop dropped, and it was not an Alt+Up/Down browse: give
+            // the application the original ESC-prefixed bytes by
+            // restoring the ESC ahead of the inner sequence.
+            self.pending_meta = false;
+            if (self.held_len < self.held.len) {
+                std.mem.copyBackwards(u8, self.held[1 .. self.held_len + 1], self.held[0..self.held_len]);
+                self.held[0] = 0x1b;
+                self.held_len += 1;
+            }
+        }
         const held = self.held[0..self.held_len];
         self.held_len = 0;
         self.prefix_held = false;
@@ -598,6 +669,10 @@ pub const InputParser = struct {
     /// itself. After an armed prefix it is the cancel key and is
     /// consumed. Any other hold replays as plain input.
     pub fn flushEsc(self: *InputParser, handler: anytype) !void {
+        // A held ESC under pending_meta is the second of an ESC ESC
+        // pair that went nowhere: replay both as plain input, not the
+        // Esc key. flushHeld restores the dropped leading ESC.
+        if (self.pending_meta) return self.flushHeld(handler);
         if (self.held_len != 1 or self.held[0] != 0x1b) {
             return self.flushHeld(handler);
         }
@@ -3480,6 +3555,69 @@ test "parser: modified arrows and releases are application input" {
     h.forwarded.clearRetainingCapacity();
     try p.feed("\x1b[1;1:3A", .{ .kitty = true }, &h);
     try std.testing.expectEqualStrings("\x1b[1;1:3A", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+}
+
+test "parser: Alt+Up/Down browses the sidebar (CSI-modifier form)" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // ESC [ 1 ; 3 A/B is Alt+Up/Down: a standalone browse chord, no
+    // prefix, marked prefixed so the UI moves the sidebar selection.
+    try p.feed("\x1b[1;3A\x1b[1;3B", .{}, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = true } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .down, .prefixed = true } },
+        h.events.items[1],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    // The report-events form with a press subfield browses too.
+    try p.feed("\x1b[1;3:1A", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = true } },
+        h.events.items[2],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: Alt+Up/Down browses the sidebar (Meta-escape form)" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // ESC ESC [ A/B is the other Alt+Up/Down encoding: a Meta ESC
+    // ahead of a bare arrow. Same browse chord, nothing leaks to the
+    // application.
+    try p.feed("\x1b\x1b[A\x1b\x1b[B", .{}, &h);
+    try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .up, .prefixed = true } },
+        h.events.items[0],
+    );
+    try std.testing.expectEqual(
+        InputEvent{ .arrow = .{ .dir = .down, .prefixed = true } },
+        h.events.items[1],
+    );
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "parser: Alt side arrows and the Alt chord stay out of the app's way" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // Only vertical Alt arrows browse; Alt+Left/Right belong to the
+    // application and replay verbatim in either encoding.
+    try p.feed("\x1b[1;3D", .{}, &h);
+    try std.testing.expectEqualStrings("\x1b[1;3D", h.forwarded.items);
+    try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+    // The Meta-escape side arrow restores its dropped ESC: ESC ESC [ C
+    // reaches the application whole.
+    h.forwarded.clearRetainingCapacity();
+    try p.feed("\x1b\x1b[C", .{}, &h);
+    try std.testing.expectEqualStrings("\x1b\x1b[C", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
 }
 

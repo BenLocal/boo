@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install boo from GitHub releases:
 #
-#   curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/BenLocal/boo/self/install.sh | sh
 #
 # Environment variables:
 #   BOO_VERSION      Release version to install, e.g. "0.1.0".
@@ -11,7 +11,7 @@
 #                    ~/.local/bin.
 set -eu
 
-REPO="coder/boo"
+REPO="BenLocal/boo"
 
 log() { printf '%s\n' "$*" >&2; }
 fail() {
@@ -115,6 +115,6 @@ case ":$PATH:" in
 	esac
 	log ""
 	log "For a system-wide install instead, rerun with:"
-	log "  curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sudo BOO_INSTALL_DIR=/usr/local/bin sh"
+	log "  curl -fsSL https://raw.githubusercontent.com/BenLocal/boo/self/install.sh | sudo BOO_INSTALL_DIR=/usr/local/bin sh"
 	;;
 esac

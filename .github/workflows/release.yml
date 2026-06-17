@@ -59,4 +59,4 @@ jobs:
             --title "$GITHUB_REF_NAME" \
             --verify-tag \
             --generate-notes \
-            --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh\`"
+            --notes "Install: \`curl -fsSL https://raw.githubusercontent.com/BenLocal/boo/self/install.sh | sh\`"

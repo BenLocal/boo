@@ -11,9 +11,9 @@ Sessions that haunt your terminal.
 
 [Install](#install) | [Usage](#usage) | [Automation](#automation) | [Why](#why-boo) | [Architecture](#architecture)
 
-[![ci](https://github.com/coder/boo/actions/workflows/ci.yml/badge.svg)](https://github.com/coder/boo/actions/workflows/ci.yml)
-[![release](https://img.shields.io/github/v/release/coder/boo)](https://github.com/coder/boo/releases/latest)
-[![license](https://img.shields.io/github/license/coder/boo)](./LICENSE)
+[![ci](https://github.com/BenLocal/boo/actions/workflows/ci.yml/badge.svg)](https://github.com/BenLocal/boo/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/BenLocal/boo)](https://github.com/BenLocal/boo/releases/latest)
+[![license](https://img.shields.io/github/license/BenLocal/boo)](./LICENSE)
 [![discord](https://img.shields.io/discord/747933592273027093?label=discord)](https://discord.gg/coder)
 
 </div>
@@ -43,10 +43,10 @@ exactly as a human would see it.
 For Linux and macOS:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/coder/boo/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/BenLocal/boo/self/install.sh | sh
 ```
 
-Pre-built binaries are published on the [releases page](https://github.com/coder/boo/releases). Set `BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
+Pre-built binaries are published on the [releases page](https://github.com/BenLocal/boo/releases). Set `BOO_VERSION` to pin a release and `BOO_INSTALL_DIR` to change the
 install location (default: `/usr/local/bin` when writable, otherwise
 `~/.local/bin`).
 
@@ -184,7 +184,7 @@ This is a young project, not a drop-in GNU screen replacement:
 
 ## Support
 
-Feel free to [open an issue](https://github.com/coder/boo/issues/new)
+Feel free to [open an issue](https://github.com/BenLocal/boo/issues/new)
 if you have questions, run into bugs, or have a feature request.
 
 ## License

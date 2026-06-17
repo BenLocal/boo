@@ -2,7 +2,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, self]
   pull_request:
 
 # mlugg/setup-zig still declares node20, which GitHub runners are

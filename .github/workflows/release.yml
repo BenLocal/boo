@@ -24,8 +24,13 @@ jobs:
       - name: Check tag matches project version
         run: |
           version="${GITHUB_REF_NAME#v}"
-          grep -Fq ".version = \"$version\"" build.zig.zon
-          grep -Fq "pub const version = \"$version\"" src/main.zig
+          # The tag may carry a date suffix (e.g. v0.5.20-20260617) so a
+          # release can be cut without bumping the code version. Verify
+          # the base version (everything before the trailing -suffix)
+          # against the sources; the date rides only on the tag.
+          base="${version%-*}"
+          grep -Fq ".version = \"$base\"" build.zig.zon
+          grep -Fq "pub const version = \"$base\"" src/main.zig
       - name: Fetch dependencies (with retry)
         run: |
           for i in 1 2 3 4 5; do

@@ -51,14 +51,14 @@ const wheel_lines = 3;
 // -- Layout -----------------------------------------------------------------
 
 /// Screen geometry: a sidebar on the left, a one-column separator,
-/// and the session viewport filling the rest of every row, including
-/// the last. The bottom sidebar row shows the keybind hint; transient
-/// status content (prompts, the keybind list, messages) overlays the
-/// last row full-width and the row repaints from session state when
-/// it clears. The viewport always reaches the right edge, so
-/// erase-to-end-of-line stays inside it. While the sidebar is hidden
-/// the viewport takes every column; sidebar_w is kept so the sidebar
-/// returns at its old width.
+/// and the session viewport filling the rest. The bottom row is a
+/// reserved, full-width status bar: it shows the keybind hint at rest
+/// and transient status content (prompts, the keybind list, messages)
+/// while present, so chrome never overwrites session output. The
+/// viewport stops one row short of the bottom for it and always reaches
+/// the right edge, so erase-to-end-of-line stays inside it. While the
+/// sidebar is hidden the viewport takes every column; sidebar_w is kept
+/// so the sidebar returns at its old width.
 pub const Layout = struct {
     rows: u16,
     cols: u16,
@@ -83,10 +83,10 @@ pub const Layout = struct {
         return self.cols -| (self.sidebar_w + 1);
     }
 
-    /// Viewport rows: the full terminal height. The status overlay
-    /// borrows the last row only while it has something to show.
+    /// Viewport rows: the terminal height minus the reserved status
+    /// bar on the bottom row, so session content never reaches it.
     pub fn viewportRows(self: Layout) u16 {
-        return self.rows;
+        return self.rows -| 1;
     }
 
     /// First viewport column, 0-based.
@@ -96,7 +96,7 @@ pub const Layout = struct {
     }
 
     /// Sidebar rows available for session entries: everything above
-    /// the keybind hint on the bottom row.
+    /// the reserved status bar on the bottom row.
     pub fn listRows(self: Layout) u16 {
         return self.rows -| 1;
     }
@@ -118,12 +118,12 @@ pub const Layout = struct {
     /// report whether the kill target ('x' in the last column) was hit.
     pub fn hit(self: Layout, x: u16, y: u16) Hit {
         if (y >= self.rows or x >= self.cols) return .none;
+        if (y == self.rows -| 1) return .none; // reserved status bar
         if (x >= self.viewportX()) {
             // A hidden sidebar puts every cell here: viewportX is 0.
             return .{ .viewport = .{ .x = x - self.viewportX(), .y = y } };
         }
         if (x >= self.sidebar_w) return .none; // separator column
-        if (y == self.rows -| 1) return .none; // keybind hint row
         return .{ .session = .{
             .row = y,
             .kill = self.sidebar_w >= 12 and x == self.sidebar_w - 2,
@@ -1795,8 +1795,9 @@ const Ui = struct {
         // A left press on the separator column (between the sidebar and
         // the viewport) grabs the divider for a resize, ahead of the
         // hit test that would otherwise treat the column as dead space.
+        // The bottom row is the full-width status bar, not a separator.
         if (!self.layout.hidden and !m.release and !m.isMotion() and !m.isWheel() and
-            m.code & 3 == 0 and x == self.layout.sidebar_w)
+            m.code & 3 == 0 and x == self.layout.sidebar_w and y != self.layout.rows -| 1)
         {
             self.divider_drag = true;
             // Repaint so the separator thickens on grab, before any drag.
@@ -2910,12 +2911,6 @@ const Ui = struct {
         }) catch return state;
         state.pos_len = text.len;
         state.visible = v.term.modes.get(.cursor_visible);
-        // A session cursor on the last row would blink over the
-        // status overlay while it shows; keep it hidden until the
-        // overlay clears.
-        if (self.statusActive() and row == self.layout.rows -| 1) {
-            state.visible = false;
-        }
         return state;
     }
 
@@ -2953,27 +2948,16 @@ const Ui = struct {
         return state;
     }
 
-    /// Whether the bottom-row status overlay has content to show: an
-    /// open prompt, the armed-prefix keybind list, an active browse,
-    /// resize, or scrollback, or a live message.
-    fn statusActive(self: *Ui) bool {
-        return self.rename_input != null or self.goto_input != null or
-            self.confirm_kill != null or self.parser.pending_prefix or
-            self.browsing or self.resizing or self.viewScrolled() or
-            self.message.items.len > 0;
-    }
-
     /// One full screen row: sidebar columns, separator, then the
     /// viewport slice. The sidebar segment is always exactly
     /// sidebar_w columns so the row never bleeds into the viewport.
-    /// While status content is active it overlays the last row full
-    /// width; the row repaints from cached state when it clears.
+    /// The bottom row is the reserved, full-width status bar.
     /// A hidden sidebar leaves the whole row to the viewport.
     fn composeRow(self: *Ui, y: u16, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
 
         try out.appendSlice(alloc, sgr_reset);
-        if (y == self.layout.rows -| 1 and self.statusActive()) {
+        if (y == self.layout.rows -| 1) {
             try self.composeStatusRow(out);
             return;
         }
@@ -2996,9 +2980,10 @@ const Ui = struct {
     const keybind_bar =
         " c new  k kill  r rename  g goto  n/p switch  up/dn browse  lt/rt resize  s sidebar  d quit  C-a last  a literal  l redraw  esc cancel";
 
-    /// Status content overlaid full-width on the last screen row
-    /// while present: rename prompt, kill confirmation, the keybind
-    /// list while the prefix is armed, or a transient message.
+    /// The reserved status bar on the last screen row, full-width:
+    /// a rename prompt, kill confirmation, the keybind list while the
+    /// prefix is armed, a transient message, the browse/resize/scrollback
+    /// hint, or — at rest — how to reach the keybinds.
     fn composeStatusRow(self: *Ui, out: *std.ArrayList(u8)) !void {
         const alloc = self.alloc;
         const w = self.layout.cols;
@@ -3032,6 +3017,10 @@ const Ui = struct {
             try text.appendSlice(alloc, " up/down select  enter attach  esc cancel");
         } else if (self.viewScrolled()) {
             try text.appendSlice(alloc, " scrollback  wheel down or esc to return");
+        } else {
+            // At rest the bar points at the keybinds, the hint that
+            // used to sit on the sidebar's bottom row.
+            try text.appendSlice(alloc, " Keybinds: Ctrl+A");
         }
         try appendClipped(alloc, out, text.items, w);
         try out.appendSlice(alloc, sgr_reset);
@@ -3042,14 +3031,8 @@ const Ui = struct {
         const l = self.layout;
         const w = l.sidebar_w;
 
-        if (y == l.rows -| 1) {
-            // The bottom sidebar row always shows how to reach the
-            // keybinds; the status overlay covers it while active.
-            try out.appendSlice(alloc, style_dim);
-            try appendClipped(alloc, out, " Keybinds: Ctrl+A", w);
-            try out.appendSlice(alloc, sgr_reset);
-            return;
-        }
+        // The bottom row is the reserved status bar, not a sidebar
+        // cell: composeRow handles it and never reaches here for it.
         const idx = self.scroll + y / Layout.entry_rows;
         if (idx < self.sessions.items.len) {
             const entry = self.sessions.items[idx];
@@ -4040,20 +4023,21 @@ test "layout: geometry and hit testing" {
     try std.testing.expectEqual(@as(u16, 24), l.sidebar_w);
     try std.testing.expectEqual(@as(u16, 75), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 25), l.viewportX());
-    try std.testing.expectEqual(@as(u16, 24), l.viewportRows());
+    try std.testing.expectEqual(@as(u16, 23), l.viewportRows());
     try std.testing.expectEqual(@as(usize, 11), l.visibleEntries());
 
-    // The session list starts on the top row. The bottom sidebar row
-    // holds the keybind hint, and the viewport extends through the
-    // last row.
+    // The session list starts on the top row. The bottom row is the
+    // reserved status bar, so the viewport's last row is row 22 and
+    // the whole bottom row is inert to hit testing.
     try std.testing.expectEqual(@as(u16, 0), l.hit(3, 0).session.row);
     try std.testing.expectEqual(@as(u16, 1), l.hit(3, 1).session.row);
-    try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 23));
-    const bottom = l.hit(80, 23);
+    const bottom = l.hit(80, 22);
     try std.testing.expectEqual(@as(u16, 55), bottom.viewport.x);
-    try std.testing.expectEqual(@as(u16, 23), bottom.viewport.y);
+    try std.testing.expectEqual(@as(u16, 22), bottom.viewport.y);
+    try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 23)); // status bar
+    try std.testing.expectEqual(Layout.Hit.none, l.hit(80, 23)); // status bar
     try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 5)); // separator
-    try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 23)); // separator, last row
+    try std.testing.expectEqual(Layout.Hit.none, l.hit(24, 23)); // status bar
 
     // Sessions take two display rows: name, then title.
     const s = l.hit(3, 5);
@@ -4200,18 +4184,20 @@ test "layout: hidden sidebar gives the viewport every column" {
     l.hidden = true;
     try std.testing.expectEqual(@as(u16, 100), l.viewportCols());
     try std.testing.expectEqual(@as(u16, 0), l.viewportX());
-    try std.testing.expectEqual(@as(u16, 24), l.viewportRows());
+    try std.testing.expectEqual(@as(u16, 23), l.viewportRows());
 
-    // Every cell is the viewport: the old sidebar area, the
-    // separator column, and the keybind hint row included.
+    // Every cell is the viewport: the old sidebar area and the
+    // separator column included. The bottom row stays the reserved
+    // status bar, inert to hit testing.
     const top = l.hit(0, 0);
     try std.testing.expectEqual(@as(u16, 0), top.viewport.x);
     try std.testing.expectEqual(@as(u16, 0), top.viewport.y);
     const sep = l.hit(24, 5);
     try std.testing.expectEqual(@as(u16, 24), sep.viewport.x);
-    const hint = l.hit(3, 23);
-    try std.testing.expectEqual(@as(u16, 3), hint.viewport.x);
-    try std.testing.expectEqual(@as(u16, 23), hint.viewport.y);
+    const last = l.hit(3, 22);
+    try std.testing.expectEqual(@as(u16, 3), last.viewport.x);
+    try std.testing.expectEqual(@as(u16, 22), last.viewport.y);
+    try std.testing.expectEqual(Layout.Hit.none, l.hit(3, 23)); // status bar
     try std.testing.expectEqual(Layout.Hit.none, l.hit(100, 5));
 
     // The width survives the hide for when the sidebar returns.

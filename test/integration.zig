@@ -1822,8 +1822,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     try h.startDetached("rz", &.{"/bin/sh"});
 
     // 100 columns - 24 sidebar - 1 separator = 75 viewport columns;
-    // the viewport spans all 24 rows, since status content only
-    // overlays the bottom row while it has something to show.
+    // 24 rows - 1 reserved status bar = 23 viewport rows.
     var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
     defer ui.deinit();
     try ui.waitFor("rz");
@@ -1834,9 +1833,10 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
     defer alloc.free(cmd);
 
     try h.sendLine("rz", cmd);
-    try waitFileEquals(alloc, size_file, "24 75\n");
+    try waitFileEquals(alloc, size_file, "23 75\n");
 
-    // Resizing the outer terminal resizes the viewport with it.
+    // Resizing the outer terminal resizes the viewport with it; the
+    // status bar still takes one row, so 30 rows leaves 29.
     try ui.setSize(30, 120);
     var deadline = Deadline.init(default_timeout_ms);
     while (true) {
@@ -1844,7 +1844,7 @@ test "ui: viewport size tracks the terminal minus the sidebar" {
         std.Thread.sleep(50 * std.time.ns_per_ms);
         const content = std.fs.cwd().readFileAlloc(alloc, size_file, 4096) catch "";
         defer if (content.len > 0) alloc.free(content);
-        if (std.mem.eql(u8, content, "30 95\n")) break;
+        if (std.mem.eql(u8, content, "29 95\n")) break;
         try deadline.tick("viewport resize never reached the session");
     }
 }
@@ -2024,7 +2024,7 @@ test "ui: the focused session exiting hands focus to the next one" {
     try std.testing.expectEqual(@as(u32, 0), try ui.waitExit());
 }
 
-test "ui: the keybind bar overlays the bottom row and C-a r renames" {
+test "ui: the reserved status bar shows the keybind list and C-a r renames" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
@@ -2035,12 +2035,13 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     defer ui.deinit();
     try ui.waitFor("oldname");
 
-    // The keybind hint sits in the sidebar's bottom row and the
-    // separator runs through the last row: no reserved status bar.
-    try waitLastRow(alloc, &ui, 24, 140, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{});
+    // The bottom row is a reserved, full-width status bar: it shows the
+    // keybind hint with no separator running through it. The separator
+    // stops at the viewport rows above (so it is still on screen).
+    try waitLastRow(alloc, &ui, 24, 140, &.{"Keybinds: Ctrl+A"}, &.{"\u{2502}"});
+    try waitScreen(alloc, &ui, 24, 140, &.{"\u{2502}"}, &.{});
 
-    // Arming the prefix overlays the keybind list across the whole
-    // bottom row, covering the sidebar hint and the separator.
+    // Arming the prefix fills the same bar with the keybind list.
     try ui.send("\x01");
     try ui.waitFor("r rename");
     try ui.waitFor("up/dn browse");
@@ -2048,10 +2049,9 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     try ui.waitFor("esc cancel");
     try waitLastRow(alloc, &ui, 24, 140, &.{"r rename"}, &.{"\u{2502}"});
 
-    // Esc backs out: the overlay reverts to the hint, the separator,
-    // and whatever the viewport had underneath.
+    // Esc backs out: the bar reverts to the keybind hint.
     try ui.send("\x1b");
-    try waitLastRow(alloc, &ui, 24, 140, &.{ "Keybinds: Ctrl+A", "\u{2502}" }, &.{"r rename"});
+    try waitLastRow(alloc, &ui, 24, 140, &.{"Keybinds: Ctrl+A"}, &.{"r rename"});
 
     // C-a r opens the prompt pre-filled with the old name; erase it
     // and type a new one.
@@ -2068,6 +2068,34 @@ test "ui: the keybind bar overlays the bottom row and C-a r renames" {
     defer alloc.free(ls.stderr);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "fresh") != null);
     try std.testing.expect(std.mem.indexOf(u8, ls.stdout, "oldname") == null);
+}
+
+test "ui: the reserved status bar never covers the session's last line" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // The session keeps repainting a marker on its very last line (row
+    // 99 clamps to the bottom). It emits the marker itself, so the text
+    // appears only where it is positioned — never in a command echo —
+    // and the loop re-pins it to whatever the bottom row is after the
+    // UI resizes the session on attach.
+    try h.startDetached("edge", &.{
+        "sh", "-c", "while :; do printf '\\033[99;1HEDGE-MARK'; sleep 0.2; done",
+    });
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("edge");
+    try waitScreen(alloc, &ui, 24, 100, &.{"EDGE-MARK"}, &.{});
+
+    // Arming the prefix fills the status bar with the keybind list.
+    // EDGE-MARK stays visible the whole time: the bar has its own row
+    // and never overwrites session content. With the old full-height
+    // viewport the marker sat on the overlaid row and vanished here.
+    try ui.send("\x01");
+    try waitLastRow(alloc, &ui, 24, 100, &.{"r rename"}, &.{"EDGE-MARK"});
+    try waitScreen(alloc, &ui, 24, 100, &.{ "EDGE-MARK", "r rename" }, &.{});
 }
 
 test "ui: a single esc cancels the rename prompt" {
@@ -2550,33 +2578,33 @@ test "ui: C-a side arrows resize the sidebar" {
 
     // Focusing the session sizes its pty to the viewport: 100
     // columns minus the 24-column sidebar and the separator.
-    try waitPeekSize(&h, "resized", 24, 75);
+    try waitPeekSize(&h, "resized", 23,75);
 
     // C-a Right grows the sidebar one column (shrinking the
     // viewport) and shows the resize hint on the bottom row.
     try ui.send("\x01\x1b[C");
     try ui.waitFor("left/right resize");
-    try waitPeekSize(&h, "resized", 24, 74);
+    try waitPeekSize(&h, "resized", 23,74);
 
     // Bare side arrows keep adjusting while the resize is active.
     ui.clearOutput();
     try ui.send("\x1b[C\x1b[C");
     try ui.waitFor("left/right resize");
-    try waitPeekSize(&h, "resized", 24, 72);
+    try waitPeekSize(&h, "resized", 23,72);
 
     // Esc restores the width from before the resize; the sidebar
     // hint returning proves the overlay cleared.
     ui.clearOutput();
     try ui.send("\x1b");
     try ui.waitFor("Keybinds: Ctrl+A");
-    try waitPeekSize(&h, "resized", 24, 75);
+    try waitPeekSize(&h, "resized", 23,75);
 
     // C-a Left shrinks the sidebar; Enter keeps the width and ends
     // the resize.
     ui.clearOutput();
     try ui.send("\x01\x1b[D");
     try ui.waitFor("left/right resize");
-    try waitPeekSize(&h, "resized", 24, 76);
+    try waitPeekSize(&h, "resized", 23,76);
     ui.clearOutput();
     try ui.send("\r");
     try ui.waitFor("Keybinds: Ctrl+A");
@@ -2589,7 +2617,7 @@ test "ui: C-a side arrows resize the sidebar" {
     try ui.waitFor("AFTER-MARK");
     const peeked = try h.waitPeekContains("resized", "AFTER-MARK");
     alloc.free(peeked);
-    try waitPeekSize(&h, "resized", 24, 76);
+    try waitPeekSize(&h, "resized", 23,76);
 }
 
 test "ui: C-a s hides the sidebar and brings it back" {
@@ -2603,15 +2631,16 @@ test "ui: C-a s hides the sidebar and brings it back" {
     defer ui.deinit();
     try ui.waitFor("tucked");
     try ui.waitFor("Keybinds: Ctrl+A");
-    try waitPeekSize(&h, "tucked", 24, 75);
+    try waitPeekSize(&h, "tucked", 23,75);
 
-    // C-a s hides the sidebar: the session list, the keybind hint,
-    // and the separator all leave the screen, and the viewport (with
-    // the session pty behind it) takes the full terminal width.
+    // C-a s hides the sidebar: the session list and the separator
+    // leave the screen and the viewport (with the session pty behind
+    // it) takes the full terminal width. The reserved status bar stays
+    // on the bottom row, so the keybind hint is still there.
     try ui.send("\x01s");
-    try waitPeekSize(&h, "tucked", 24, 100);
-    try waitScreen(alloc, &ui, 24, 100, &.{}, &.{
-        "tucked", "Keybinds: Ctrl+A", "\u{2502}",
+    try waitPeekSize(&h, "tucked", 23,100);
+    try waitScreen(alloc, &ui, 24, 100, &.{"Keybinds: Ctrl+A"}, &.{
+        "tucked", "\u{2502}",
     });
 
     // Typed input still reaches the focused session while hidden.
@@ -2620,7 +2649,7 @@ test "ui: C-a s hides the sidebar and brings it back" {
 
     // C-a s again brings the sidebar back at its old width.
     try ui.send("\x01s");
-    try waitPeekSize(&h, "tucked", 24, 75);
+    try waitPeekSize(&h, "tucked", 23,75);
     try waitScreen(alloc, &ui, 24, 100, &.{
         "tucked", "Keybinds: Ctrl+A", "\u{2502}",
     }, &.{});

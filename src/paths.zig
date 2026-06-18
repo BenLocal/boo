@@ -92,11 +92,11 @@ pub fn statePath(alloc: std.mem.Allocator, dir: []const u8, name: []const u8) ![
 }
 
 /// Names of sessions with a saved snapshot but no live socket: the
-/// sessions whose daemon died without cleaning up (a crash or reboot)
-/// that `boo restore` can bring back. Snapshots
-/// (`<name>.state`) live in `state_dir`; live sockets (`<name>.sock`) in
-/// `socket_dir`, which may be a different directory. Caller frees each
-/// name and the list.
+/// sessions `boo restore` can bring back, whose snapshots outlived a full
+/// shutdown (`kill --all`, a crash, or a reboot) rather than being swept
+/// by a surviving daemon. Snapshots (`<name>.state`) live in `state_dir`;
+/// live sockets (`<name>.sock`) in `socket_dir`, which may be a different
+/// directory. Caller frees each name and the list.
 pub fn restorableSessions(
     alloc: std.mem.Allocator,
     state_dir: []const u8,
@@ -137,6 +137,35 @@ pub fn restorableSessions(
     }
 
     return names.toOwnedSlice(alloc);
+}
+
+/// Reap orphaned snapshots: delete every `<name>.state` in `state_dir`
+/// whose session is no longer live (no `<name>.sock` in `socket_dir`). A
+/// daemon calls this on each snapshot tick, so a snapshot left behind by a
+/// killed or cleanly-exited session is cleaned up while some other session
+/// still runs. A live session keeps its own snapshot (its socket exists);
+/// after a full shutdown no daemon runs the sweep, so those snapshots
+/// survive for `boo restore`. Best-effort: a directory that will not open
+/// or a file that will not unlink is left alone. If `socket_dir` itself
+/// cannot be opened nothing is swept — never reap when liveness is unknown.
+pub fn sweepOrphanSnapshots(state_dir: []const u8, socket_dir: []const u8) void {
+    var sdir = std.fs.cwd().openDir(state_dir, .{ .iterate = true }) catch return;
+    defer sdir.close();
+    var sockdir = std.fs.cwd().openDir(socket_dir, .{}) catch return;
+    defer sockdir.close();
+
+    var it = sdir.iterate();
+    while (it.next() catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".state")) continue;
+        const name = entry.name[0 .. entry.name.len - ".state".len];
+        validateName(name) catch continue;
+        // A live socket means the session is still running; keep its snapshot.
+        var buf: [max_name_len + ".sock".len]u8 = undefined;
+        const sock = std.fmt.bufPrint(&buf, "{s}.sock", .{name}) catch continue;
+        if (sockdir.access(sock, .{})) |_| continue else |_| {}
+        // Deleting the just-returned entry mid-iteration is safe on Linux.
+        sdir.deleteFile(entry.name) catch {};
+    }
 }
 
 /// Map an arbitrary string onto the session-name character set: bytes
@@ -278,6 +307,39 @@ test "restorableSessions lists snapshots without a live socket" {
     }
     try std.testing.expectEqual(@as(usize, 1), names.len);
     try std.testing.expectEqualStrings("dead", names[0]);
+}
+
+test "sweepOrphanSnapshots reaps snapshots without a live socket" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // Snapshots and sockets live in separate directories.
+    try tmp.dir.makePath("state");
+    try tmp.dir.makePath("sock");
+    const state = try tmp.dir.realpathAlloc(alloc, "state");
+    defer alloc.free(state);
+    const sock = try tmp.dir.realpathAlloc(alloc, "sock");
+    defer alloc.free(sock);
+
+    var sdir = try tmp.dir.openDir("state", .{});
+    defer sdir.close();
+    var kdir = try tmp.dir.openDir("sock", .{});
+    defer kdir.close();
+
+    // dead: a snapshot with no socket -> reaped.
+    try sdir.writeFile(.{ .sub_path = "dead.state", .data = "/home/u\n" });
+    // live: a snapshot whose socket still exists -> kept.
+    try sdir.writeFile(.{ .sub_path = "live.state", .data = "/tmp\n" });
+    try kdir.writeFile(.{ .sub_path = "live.sock", .data = "" });
+    // an invalid name is left untouched.
+    try sdir.writeFile(.{ .sub_path = ".hidden.state", .data = "/x" });
+
+    sweepOrphanSnapshots(state, sock);
+
+    // The orphan is gone; the live snapshot and the odd file remain.
+    try std.testing.expectError(error.FileNotFound, sdir.access("dead.state", .{}));
+    try sdir.access("live.state", .{});
+    try sdir.access(".hidden.state", .{});
 }
 
 test "socketDirFrom prefers BOO_DIR and creates it" {

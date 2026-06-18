@@ -37,7 +37,7 @@ pub const overview =
     \\
     \\  Administration
     \\    kill <name | --all>          end a session, or all of them
-    \\    restore [name]               re-create a session lost to a crash
+    \\    restore [name]               re-create a session from its snapshot
     \\    rename <name> <new-name>     rename a session
     \\
     \\  Information
@@ -277,15 +277,15 @@ pub const commands = [_]Entry{
         .body =
         \\usage: boo restore [name]
         \\
-        \\Re-create sessions lost to a crash or reboot, in their last
+        \\Re-create sessions from their last snapshot, in their saved
         \\working directory. The daemon periodically snapshots each
         \\session's cwd; the running process itself cannot be brought
         \\back, so a fresh $SHELL is started in the saved directory.
         \\
-        \\Sessions ended on purpose are not restored: a clean exit or an
-        \\explicit 'boo kill' drops the snapshot. Only a session whose
-        \\daemon died without cleaning up (a crash, a SIGKILL, or a
-        \\reboot) leaves one behind.
+        \\Snapshots outlive a full shutdown — 'boo kill --all', a crash,
+        \\or a reboot — so afterwards every session can be brought back.
+        \\While other sessions keep running, an ended session's snapshot
+        \\is swept away and is not restored.
         \\
         \\With a name, restores just that session; with none, every
         \\session that has a saved snapshot but is no longer running.

@@ -88,8 +88,9 @@ pub const Daemon = struct {
     sig_read: posix.fd_t = -1,
     quitting: bool = false,
 
-    /// How often the session's working directory is snapshotted for restore.
-    const snapshot_interval_ms: i64 = 30_000;
+    /// How often the session's working directory is snapshotted for
+    /// restore, and how often orphaned snapshots are swept.
+    const snapshot_interval_ms: i64 = 1_000;
 
     pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
         var self: Daemon = .{
@@ -137,12 +138,12 @@ pub const Daemon = struct {
         }
         self.conns.deinit(self.alloc);
         self.retireListener();
-        // Any graceful shutdown — a clean command exit or an explicit
-        // `boo kill` — drops the snapshot: the session ended on purpose,
-        // so there is nothing meaningful to restore. Only an unclean
-        // death (a crash, a SIGKILL, or a reboot) skips deinit and leaves
-        // the snapshot behind for `boo restore`.
-        self.deleteSnapshot();
+        // The snapshot is left in place: teardown no longer deletes it.
+        // A surviving daemon's periodic sweep reaps it once its socket is
+        // gone (see maybeSaveSnapshot), so an orphan does not linger while
+        // other sessions run. After a full shutdown — `kill --all`, a
+        // crash, or a reboot — no daemon runs the sweep, so the snapshots
+        // stay behind for `boo restore`.
         if (self.owned_name) |n| self.alloc.free(n);
         if (self.owned_socket_path) |p| self.alloc.free(p);
         if (self.sig_read >= 0) posix.close(self.sig_read);
@@ -170,11 +171,17 @@ pub const Daemon = struct {
     }
 
     fn maybeSaveSnapshot(self: *Daemon) void {
-        if (self.opts.state_dir == null) return;
+        const dir = self.opts.state_dir orelse return;
         const now = std.time.milliTimestamp();
         if (now - self.last_save_ms < snapshot_interval_ms) return;
         self.last_save_ms = now;
         self.saveSnapshot();
+        // Reap snapshots orphaned by sessions that have since ended. A
+        // killed or cleanly-exited session no longer deletes its own
+        // snapshot on the way out; this sweep, run by every live daemon,
+        // cleans them up. The socket dir is the snapshot's sibling.
+        const sock_dir = std.fs.path.dirname(self.opts.socket_path) orelse ".";
+        paths.sweepOrphanSnapshots(dir, sock_dir);
     }
 
     /// Atomically write the session's current working directory to
@@ -208,32 +215,6 @@ pub const Daemon = struct {
         } else {
             std.fs.cwd().deleteFile(tmp) catch {};
         }
-    }
-
-    /// Remove the restore snapshot on a graceful shutdown — a clean
-    /// command exit or an explicit `boo kill` — so `boo restore` will
-    /// not bring the session back.
-    fn deleteSnapshot(self: *Daemon) void {
-        const dir = self.opts.state_dir orelse return;
-        const name = self.owned_name orelse self.opts.name;
-        const path = paths.statePath(self.alloc, dir, name) catch return;
-        defer self.alloc.free(path);
-        std.fs.cwd().deleteFile(path) catch {};
-    }
-
-    /// Move the restore snapshot to follow a rename: <old>.state ->
-    /// <new>.state. The snapshot is keyed by session name like the
-    /// socket is, so a rename that left <old>.state behind would make
-    /// `boo restore` resurrect a ghost under the old name. Best-effort
-    /// and silent: the snapshot may not exist yet (no save in the first
-    /// interval), which is just nothing to move.
-    fn renameSnapshot(self: *Daemon, old_name: []const u8, new_name: []const u8) void {
-        const dir = self.opts.state_dir orelse return;
-        const old_path = paths.statePath(self.alloc, dir, old_name) catch return;
-        defer self.alloc.free(old_path);
-        const new_path = paths.statePath(self.alloc, dir, new_name) catch return;
-        defer self.alloc.free(new_path);
-        std.fs.cwd().rename(old_path, new_path) catch {};
     }
 
     fn loop(self: *Daemon) !void {
@@ -576,10 +557,9 @@ pub const Daemon = struct {
             return;
         };
 
-        // The restore snapshot is name-keyed too; move it so no stale
-        // <old>.state lingers for `boo restore` to resurrect.
-        self.renameSnapshot(self.opts.name, new_name);
-
+        // No need to move the name-keyed snapshot: the next snapshot
+        // writes it under the new name, and the periodic sweep reaps the
+        // stale <old>.state once its socket is gone (see maybeSaveSnapshot).
         if (self.owned_name) |n| self.alloc.free(n);
         if (self.owned_socket_path) |p| self.alloc.free(p);
         self.owned_name = new_owned_name;

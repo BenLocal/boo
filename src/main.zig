@@ -350,10 +350,12 @@ fn createSession(
     try attachLoop(alloc, dir, name);
 }
 
-/// Re-create sessions lost to a crash or reboot in their last working
-/// directory; sessions ended on purpose drop their snapshot and are not
-/// restored. With a name, restores just that session; with none, every
-/// session that has a saved snapshot but no live socket.
+/// Re-create sessions from their last snapshot in their saved working
+/// directory. A surviving daemon sweeps the snapshot of any session that
+/// ended while it ran, so what remains to restore is whatever outlived a
+/// full shutdown (`kill --all`, a crash, or a reboot). With a name,
+/// restores just that session; with none, every session that has a saved
+/// snapshot but no live socket.
 fn cmdRestore(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name_arg: ?[]const u8 = null;
     for (args) |arg| {

@@ -414,10 +414,10 @@ test "restore: an orphaned snapshot is brought back in its saved directory" {
     var real_buf: [std.fs.max_path_bytes]u8 = undefined;
     const real = try std.fs.cwd().realpath(work, &real_buf);
 
-    // A snapshot left behind by a daemon that died without cleaning up
-    // (a crash, a SIGKILL, or a reboot): a <name>.state in the config
-    // dir with no live socket. That orphan is the only thing `boo
-    // restore` revives — a session ended on purpose drops its snapshot.
+    // A snapshot that outlived its session: a <name>.state in the config
+    // dir with no live socket, as a full shutdown (`kill --all`, a crash,
+    // or a reboot) leaves behind. With no daemon running to sweep it, the
+    // orphan stays put for `boo restore` to revive.
     const boo_dir = try std.fs.path.join(alloc, &.{ h.dir, "boo" });
     defer alloc.free(boo_dir);
     try std.fs.cwd().makePath(boo_dir);
@@ -435,61 +435,68 @@ test "restore: an orphaned snapshot is brought back in its saved directory" {
     defer alloc.free(peek);
 }
 
-test "restore: an explicit kill drops the snapshot" {
+test "restore: kill --all keeps snapshots so sessions can return" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    // cat waits for stdin; the daemon snapshots its cwd at startup.
-    try h.startDetached("k", &.{"cat"});
-    const state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "k.state" });
-    defer alloc.free(state);
+    // Two detached sessions; each daemon snapshots its cwd at startup.
+    try h.startDetached("a", &.{"cat"});
+    try h.startDetached("b", &.{"cat"});
+    const a_state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "a.state" });
+    defer alloc.free(a_state);
+    const b_state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "b.state" });
+    defer alloc.free(b_state);
 
-    // Wait for the snapshot to be written.
+    // Wait for both snapshots to be written.
     var d1 = Deadline.init(default_timeout_ms);
-    while (std.fs.cwd().access(state, .{})) |_| break else |_| {
-        try d1.tick("snapshot never written");
+    while (true) {
+        const a_ok = if (std.fs.cwd().access(a_state, .{})) |_| true else |_| false;
+        const b_ok = if (std.fs.cwd().access(b_state, .{})) |_| true else |_| false;
+        if (a_ok and b_ok) break;
+        try d1.tick("snapshots never written");
     }
 
-    // An explicit kill ends the session on purpose, so its snapshot is
-    // removed: the session must not be restorable afterwards.
-    try h.runOk(&.{ "kill", "k" });
-    var d2 = Deadline.init(default_timeout_ms);
-    while (true) {
-        std.fs.cwd().access(state, .{}) catch break; // gone
-        try d2.tick("snapshot not removed on kill");
-    }
-    try h.runExit(&.{ "restore", "k" }, 3);
+    // kill --all ends every session at once. The snapshot sweep only runs
+    // inside a live daemon, so a full teardown leaves no one to reap them:
+    // the snapshots survive for `boo restore`.
+    try h.runOk(&.{ "kill", "--all" });
+    try std.fs.cwd().access(a_state, .{});
+    try std.fs.cwd().access(b_state, .{});
+
+    // Restoring 'a' proves the bulk teardown left a usable snapshot. (Once
+    // 'a' is back, its sweep reaps the now-orphaned 'b', so don't race it.)
+    try h.runOk(&.{ "restore", "a" });
+    try h.waitSessionUp("a");
 }
 
-test "restore: a clean command exit drops the snapshot" {
+test "snapshot GC: a running daemon reaps an orphaned snapshot" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
     defer h.deinit();
 
-    // cat waits for stdin; the daemon snapshots its cwd at startup.
-    try h.startDetached("c", &.{"cat"});
-    const state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "c.state" });
-    defer alloc.free(state);
+    // A live session whose daemon runs the periodic snapshot sweep.
+    try h.startDetached("keeper", &.{"cat"});
 
-    // Wait for the snapshot to be written.
-    var d1 = Deadline.init(default_timeout_ms);
+    // An orphaned snapshot: a <name>.state with no matching socket, as a
+    // crashed daemon would leave behind. Snapshots live in <h.dir>/boo.
+    const boo_dir = try std.fs.path.join(alloc, &.{ h.dir, "boo" });
+    defer alloc.free(boo_dir);
+    try std.fs.cwd().makePath(boo_dir);
+    const ghost = try std.fs.path.join(alloc, &.{ boo_dir, "ghost.state" });
+    defer alloc.free(ghost);
+    try std.fs.cwd().writeFile(.{ .sub_path = ghost, .data = "/tmp\n" });
+
+    // The keeper's next sweep reaps the orphan...
+    var d = Deadline.init(default_timeout_ms);
     while (true) {
-        const content = std.fs.cwd().readFileAlloc(alloc, state, 4096) catch "";
-        defer if (content.len > 0) alloc.free(content);
-        if (content.len > 0) break;
-        try d1.tick("snapshot never written");
+        std.fs.cwd().access(ghost, .{}) catch break; // gone
+        try d.tick("orphaned snapshot was never reaped");
     }
-
-    // Ctrl-D (EOF) makes cat exit on its own.
-    try h.runOk(&.{ "send", "c", "--text", "\x04" });
-
-    // The snapshot is removed, so the session is not restorable.
-    var d2 = Deadline.init(default_timeout_ms);
-    while (true) {
-        std.fs.cwd().access(state, .{}) catch break; // gone
-        try d2.tick("snapshot not removed on clean exit");
-    }
+    // ...while its own snapshot, backed by a live socket, survives.
+    const keeper_state = try std.fs.path.join(alloc, &.{ boo_dir, "keeper.state" });
+    defer alloc.free(keeper_state);
+    try std.fs.cwd().access(keeper_state, .{});
 }
 
 test "vt sequences: cursor movement, SGR, and clear are emulated" {

@@ -344,8 +344,10 @@ pub const Daemon = struct {
 
     fn handleMsg(self: *Daemon, conn: *Conn, msg: protocol.Msg) !void {
         switch (msg.type) {
+            .ui => conn.ui = true,
+
             .attach => {
-                const a = try protocol.AttachPayload.decode(msg.payload);
+                const size = try protocol.SizePayload.decode(msg.payload);
                 // Steal from any previously attached client.
                 for (self.conns.items) |other| {
                     if (other != conn and other.attached) {
@@ -354,14 +356,15 @@ pub const Daemon = struct {
                     }
                 }
                 conn.attached = true;
-                conn.ui = a.ui;
                 self.key_parser = .{};
-                self.resizeWindow(a.rows, a.cols);
+                self.resizeWindow(size.rows, size.cols);
                 self.updatePassthrough();
                 // A ui view starts with an empty terminal; seed its
                 // scrollback with the window's history (sized to the
                 // client) before the repaint puts the live screen at
-                // the bottom. Best effort: failure just means no history.
+                // the bottom. conn.ui is set by the `.ui` marker the
+                // client sends just before attaching. Best effort:
+                // failure just means no history.
                 if (conn.ui) self.historyTo(conn) catch {};
                 try self.repaintTo(conn);
             },

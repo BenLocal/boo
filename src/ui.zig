@@ -47,6 +47,14 @@ const esc_flush_ms: i64 = 50;
 /// Rows per mouse wheel tick, both for paging local scrollback and
 /// for the arrow keys sent to alternate-screen applications.
 const wheel_lines = 3;
+/// Kitty keyboard flags boo forces on the real terminal while the C-a
+/// prefix is engaged: "disambiguate" (1), "report event types" (2),
+/// and "report all keys as escape codes" (8). With these the command
+/// key and its auto-repeats and release arrive as distinguishable
+/// CSI-u events, so a held command key is swallowed deterministically
+/// instead of leaking into the focused session. Terminals without the
+/// kitty protocol ignore the request.
+const report_events_flags: u5 = 0b01011;
 
 // -- Layout -----------------------------------------------------------------
 
@@ -240,6 +248,13 @@ pub const InputParser = struct {
     /// so a sequence in flight while the mirror flips replays whole
     /// instead of splitting.
     prot: keys.Protocols = .{},
+    /// Codepoint of the command key that ran the most recent prefix
+    /// command while its auto-repeats and release are still expected.
+    /// The UI forces kitty report-events for the duration, so the held
+    /// key's repeat (event 2) and release (event 3) arrive as CSI-u
+    /// events and are dropped here instead of leaking into the
+    /// now-focused session. Null when no command key is being released.
+    swallow_cp: ?u32 = null,
 
     const hold_max = 40;
     /// The Alt bit in a cursor-key modifier mask (caps/num lock
@@ -256,6 +271,9 @@ pub const InputParser = struct {
     /// currently mirrors. The raw prefix byte is always recognized.
     pub fn feed(self: *InputParser, input: []const u8, prot: keys.Protocols, handler: anytype) !void {
         self.prot = prot;
+        // Without the kitty protocol there are no release events to end
+        // a command-key swallow, so never let a stale one linger.
+        if (!prot.kitty) self.swallow_cp = null;
         var start: usize = 0;
         var i: usize = 0;
         while (i < input.len) {
@@ -311,6 +329,11 @@ pub const InputParser = struct {
                 }
                 i += 1;
                 start = i;
+                // The command key may still be held; begin swallowing
+                // its repeats and release. A control byte (C-d) maps to
+                // its letter keycode so a kitty release of the same
+                // physical key matches. Inert without report-events.
+                self.swallow_cp = if (byte < 0x20) @as(u32, byte) | 0x60 else byte;
                 try handler.event(.{ .prefix = byte });
                 continue;
             }
@@ -530,6 +553,10 @@ pub const InputParser = struct {
             }
             // Esc backs out of the armed prefix, like the raw byte.
             if (key.cp == 27 and plain) return;
+            // The command key may still be held: begin swallowing its
+            // auto-repeats and release so they do not leak into the
+            // session once the command runs.
+            self.swallow_cp = key.cp;
             if (ctrl_only and cp >= 'a' and cp <= 'z') {
                 return handler.event(.{ .prefix = @intCast(cp & 0x1f) });
             }
@@ -539,6 +566,26 @@ pub const InputParser = struct {
             return handler.event(.{
                 .prefix = if (cp <= 0x7f) @as(u8, @intCast(cp)) else '?',
             });
+        }
+
+        // The command key that ran a prefix command may still be held:
+        // under the forced report-events flags its own auto-repeats
+        // (event 2) and release (event 3) arrive as CSI-u events.
+        // Swallow them, plus any modifier-key noise from the C-a chord,
+        // until the key is released, so none of it reaches the
+        // now-focused session.
+        if (self.swallow_cp) |held_cp| {
+            if (key.cp == held_cp) {
+                self.held_len = 0;
+                if (release) self.swallow_cp = null;
+                return;
+            }
+            if (keys.isModifierKey(key.cp)) {
+                self.held_len = 0;
+                return;
+            }
+            // Any other real key means the command key's hold is over.
+            self.swallow_cp = null;
         }
 
         if (cp == 'a' and ctrl_only) {
@@ -758,12 +805,15 @@ pub const View = struct {
         self.stream = .initAlloc(alloc, handler);
         errdefer self.stream.deinit();
 
-        try protocol.writeMsg(sock, .attach, &(protocol.AttachPayload{
+        // Mark this connection as a ui view before attaching, so the
+        // daemon replays scrollback history on attach. A ui view renders
+        // from terminal state, so it can take the replay and page it on
+        // a wheel-up. An older daemon ignores the unknown `.ui` message
+        // and just attaches with no history.
+        try protocol.writeMsg(sock, .ui, "");
+        try protocol.writeMsg(sock, .attach, &(protocol.SizePayload{
             .rows = @max(rows, 1),
             .cols = @max(cols, 1),
-            // A ui view renders from terminal state, so it can take a
-            // scrollback-history replay and page it on a wheel-up.
-            .ui = true,
         }).encode());
 
         return self;
@@ -1117,7 +1167,7 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8, max_scrollback: usize) !vo
     // mode switch. The drain absorbs a still-held quit key, whose
     // repeats would otherwise reach the shell; a C-d tail gets the
     // longer EOF guard.
-    defer client.restoreTty(tty, saved, restore_sequence, ui.eof_guard);
+    defer client.restoreTty(tty, saved, restore_sequence, ui.eof_guard, ui.parser.swallow_cp orelse 0);
     try protocol.writeAll(1, enter_sequence);
 
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
@@ -1240,6 +1290,12 @@ const Ui = struct {
     need_render: bool = true,
     /// Force every row out on the next render (resize, C-a l).
     full_render: bool = true,
+    /// A freshly focused view is seeded by the daemon with a scrollback
+    /// history replay followed by a repaint that ends in a `.screen`
+    /// message. Until that marker arrives the viewport is painted blank
+    /// rather than from the half-applied stream, so a large history
+    /// replay never flashes partial scrollback before the live screen.
+    awaiting_attach_repaint: bool = false,
     last_render_ms: i64 = 0,
     next_refresh_ms: i64 = 0,
 
@@ -1441,6 +1497,14 @@ const Ui = struct {
             self.confirm_kill != null or self.browsing or self.resizing;
     }
 
+    /// Whether the C-a prefix is mid-interaction: armed and awaiting
+    /// the command key, or still swallowing that key's auto-repeats and
+    /// release. The keyboard mirror forces report-events for the
+    /// duration so the held command key is dropped deterministically.
+    fn prefixEngaged(self: *Ui) bool {
+        return self.parser.pending_prefix or self.parser.swallow_cp != null;
+    }
+
     /// Mirror the focused application's keyboard protocol state
     /// (kitty flags and modifyOtherKeys) onto the real terminal, the
     /// same state the repaint of a plain attach replays. Without the
@@ -1457,6 +1521,11 @@ const Ui = struct {
                 kitty = v.term.screens.active.kitty_keyboard.current().int();
                 modify = v.term.flags.modify_other_keys_2;
             }
+            // While the C-a prefix is engaged, force report-events so a
+            // held command key's repeats and release are distinguishable
+            // CSI-u events the parser can swallow, instead of ambiguous
+            // raw bytes that would leak into the focused session.
+            if (self.prefixEngaged()) kitty |= report_events_flags;
         }
         if (kitty != self.kitty_flags) {
             self.kitty_flags = kitty;
@@ -1517,6 +1586,11 @@ const Ui = struct {
                 // any other key.
                 if (self.resizing) self.commitResize();
                 try self.handlePrefix(byte);
+                // Prompts and other key-owning modes read byte-wise with
+                // the mirror suspended, so there is no report-events
+                // stream to release-swallow; drop the latch so it cannot
+                // force the flags back on when the mode ends.
+                if (self.uiOwnsKeyboard()) self.parser.swallow_cp = null;
             },
             .arrow => |a| switch (a.dir) {
                 .left, .right => {
@@ -2122,6 +2196,30 @@ const Ui = struct {
                 },
                 .screen => {
                     v.app_alt = std.mem.eql(u8, msg.payload, "alt");
+                    // The attach replay (history, then repaint) ends
+                    // with this marker; release the hold and reveal the
+                    // live screen. The seeded viewport rows streamed in
+                    // while they were painted blank, and composeFrame
+                    // clears libghostty's dirty bits every one of those
+                    // frames, so the rows are no longer flagged dirty:
+                    // invalidate the viewport cache so the reveal
+                    // re-serializes them from the now-complete screen
+                    // rather than reusing stale bytes. This stops short
+                    // of a full repaint on purpose. The row-level diff
+                    // still skips rows whose bytes are unchanged (the
+                    // sidebar, blank gaps), so the reveal writes only the
+                    // live rows, exactly as a plain attach's first
+                    // repaint does. A full-screen rewrite here would
+                    // instead emit every row at once, and a ui whose
+                    // terminal is momentarily undrained blocks on that
+                    // larger write (macOS PTY buffering, see restoreTty)
+                    // and wedges the loop before it reads the next key
+                    // or SIGWINCH.
+                    if (self.awaiting_attach_repaint) {
+                        self.awaiting_attach_repaint = false;
+                        for (self.viewport_cache.items) |*row| row.valid = false;
+                        self.need_render = true;
+                    }
                 },
                 .exit => {
                     v.state = .ended;
@@ -2328,6 +2426,9 @@ const Ui = struct {
         self.view_gen += 1;
         self.full_render = true;
         self.need_render = true;
+        // The daemon streams this view's history then a repaint; hold
+        // the viewport blank until that repaint's `.screen` arrives.
+        self.awaiting_attach_repaint = true;
     }
 
     fn rememberLast(self: *Ui, idx: usize) void {
@@ -2577,7 +2678,12 @@ const Ui = struct {
         return @intCast(std.math.clamp(want, lo, hi));
     }
 
-    /// Create a session by re-running our own binary with `new -d`.
+    /// Create a session by re-running our own binary with `new -d`,
+    /// sized to the viewport so it is born at the geometry it will be
+    /// shown at. Otherwise the session starts at the daemon default and
+    /// is only corrected when the UI attaches, so its first prompt and
+    /// any early output land mis-sized until the next resize.
+    ///
     /// The exec drops every inherited descriptor (they are all
     /// CLOEXEC), so the daemon cannot pin the UI's sockets open, and
     /// naming falls back exactly like the CLI.
@@ -2588,9 +2694,15 @@ const Ui = struct {
         };
         defer self.alloc.free(exe);
 
+        // u16 is at most five digits; the buffers never overflow.
+        var rows_buf: [6]u8 = undefined;
+        var cols_buf: [6]u8 = undefined;
+        const rows = std.fmt.bufPrint(&rows_buf, "{d}", .{@max(self.layout.viewportRows(), 1)}) catch unreachable;
+        const cols = std.fmt.bufPrint(&cols_buf, "{d}", .{@max(self.layout.viewportCols(), 1)}) catch unreachable;
+
         const result = std.process.Child.run(.{
             .allocator = self.alloc,
-            .argv = &.{ exe, "new", "-d" },
+            .argv = &.{ exe, "new", "-d", "--rows", rows, "--cols", cols },
         }) catch {
             self.setMessage("create failed", .{});
             return;
@@ -2895,6 +3007,9 @@ const Ui = struct {
         if (self.renameCursor()) |s| return s;
         if (self.gotoCursor()) |s| return s;
         const v = self.liveView() orelse return state;
+        // The viewport is blank while the view is being seeded; keep the
+        // cursor hidden until the attach repaint releases it.
+        if (self.awaiting_attach_repaint) return state;
         // While scrolled back the cursor coordinates belong to the
         // bottom of the screen, not the history rows on display, so
         // keep the cursor hidden until the viewport snaps back.
@@ -3118,7 +3233,11 @@ const Ui = struct {
             },
         }
 
-        if (y < v.term.rows) {
+        // While the view is still being seeded (history replay and
+        // repaint in flight) the viewport stays blank, so a large
+        // replay never flashes partial scrollback before snapping to
+        // the live screen; the repaint's `.screen` releases it.
+        if (!self.awaiting_attach_repaint and y < v.term.rows) {
             try self.appendViewportRow(v, y, out);
         }
         try out.appendSlice(alloc, sgr_reset);
@@ -3937,6 +4056,79 @@ test "parser: paste markers still decode while modify is mirrored" {
     try std.testing.expectEqual(@as(usize, 2), h.events.items.len);
     try std.testing.expectEqual(InputEvent{ .paste = true }, h.events.items[0]);
     try std.testing.expectEqual(InputEvent{ .paste = false }, h.events.items[1]);
+}
+
+test "parser: a held command key's repeats and release are swallowed" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // C-a then c, the way a report-events terminal sends them: the
+    // command key as a CSI-u press, then its auto-repeat and release.
+    // The repeats and release must not reach the now-focused session.
+    try p.feed("\x1b[97;5u\x1b[99;1:1u", .{ .kitty = true }, &h);
+    try p.feed("\x1b[99;1:2u\x1b[99;1:3u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'c' }, h.events.items[0]);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try std.testing.expectEqual(@as(?u32, null), p.swallow_cp);
+}
+
+test "parser: a raw-byte command key still swallows its CSI-u repeats" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // The prefix and command key arrive as raw bytes (the common case
+    // before the forced flags take effect on the terminal); once
+    // report-events turns on, the held key's repeats and release arrive
+    // as CSI-u events keyed on the same codepoint and must be dropped.
+    try p.feed("\x01c", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'c' }, h.events.items[0]);
+    try p.feed("\x1b[99;1:2u\x1b[99;1:3u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try std.testing.expectEqual(@as(?u32, null), p.swallow_cp);
+}
+
+test "parser: a real key after the command ends the swallow" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x01c", .{ .kitty = true }, &h);
+    // A genuinely different key is the user's input for the focused
+    // session, not part of the command key's hold: it ends the swallow
+    // and reaches the application.
+    try p.feed("\x1b[120;1:1u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqualStrings("\x1b[120;1:1u", h.forwarded.items);
+    try std.testing.expectEqual(@as(?u32, null), p.swallow_cp);
+}
+
+test "parser: modifier noise during the swallow is dropped" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    try p.feed("\x01c", .{ .kitty = true }, &h);
+    // A left-ctrl release from the C-a chord (reported under report-all)
+    // is keyboard noise: dropped, not forwarded, and it does not end
+    // the swallow. The command key's own release then ends it.
+    try p.feed("\x1b[57442;5:3u\x1b[99;1:3u", .{ .kitty = true }, &h);
+    try std.testing.expectEqual(@as(usize, 1), h.events.items.len);
+    try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+    try std.testing.expectEqual(@as(?u32, null), p.swallow_cp);
+}
+
+test "parser: without kitty the swallow latch self-heals" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // A command key dispatched without the kitty protocol arms the
+    // latch, but there are no release events to end it, so the next
+    // feed clears it and later input is never wrongly swallowed.
+    try p.feed("\x01c", .{}, &h);
+    try std.testing.expectEqual(InputEvent{ .prefix = 'c' }, h.events.items[0]);
+    try p.feed("z", .{}, &h);
+    try std.testing.expectEqualStrings("z", h.forwarded.items);
+    try std.testing.expectEqual(@as(?u32, null), p.swallow_cp);
 }
 
 test "ui: automatic focus skips attached sessions and prefers recent ones" {

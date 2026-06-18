@@ -12,7 +12,7 @@ const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
 const config = @import("config.zig");
 
-pub const version = "0.5.20";
+pub const version = "0.5.22";
 
 /// Route std.log through a filter. libghostty's VT stream parser logs
 /// unimplemented sequences at info level under the `stream` scope (e.g.
@@ -123,6 +123,14 @@ fn flagValue(
         return arg[flag.len + 1 ..];
     }
     return null;
+}
+
+/// Parse a positive terminal dimension (rows or cols) for `boo new`.
+fn parseDimension(comptime flag: []const u8, value: []const u8) u16 {
+    const n = std.fmt.parseInt(u16, value, 10) catch
+        usageFail("new", flag ++ " expects a number from 1 to 65535", .{});
+    if (n == 0) usageFail("new", flag ++ " must be at least 1", .{});
+    return n;
 }
 
 fn printHelpPage(name: []const u8) !void {
@@ -240,6 +248,8 @@ fn mustControl(
 fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
     var name: ?[]const u8 = null;
     var detached = false;
+    var rows: ?u16 = null;
+    var cols: ?u16 = null;
     var cmd_argv: []const [:0]const u8 = &.{};
 
     var i: usize = 0;
@@ -252,6 +262,10 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
             detached = true;
         } else if (isHelpFlag(arg)) {
             return printHelpPage("new");
+        } else if (flagValue("new", "--rows", args, &i)) |v| {
+            rows = parseDimension("--rows", v);
+        } else if (flagValue("new", "--cols", args, &i)) |v| {
+            cols = parseDimension("--cols", v);
         } else if (arg.len > 0 and arg[0] == '-') {
             usageFail("new", "unknown flag '{s}'", .{arg});
         } else if (name == null) {
@@ -263,7 +277,7 @@ fn cmdNew(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
 
     const dir = try paths.socketDir(alloc);
     defer alloc.free(dir);
-    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), null);
+    return createSession(alloc, dir, name, detached, @ptrCast(cmd_argv), null, rows, cols);
 }
 
 fn createSession(
@@ -273,6 +287,8 @@ fn createSession(
     detached: bool,
     cmd_argv: []const []const u8,
     cwd: ?[]const u8,
+    rows: ?u16,
+    cols: ?u16,
 ) !void {
     var name_buf: [paths.max_name_len]u8 = undefined;
     const name = name_opt orelse paths.defaultName(&name_buf, dir);
@@ -306,7 +322,7 @@ fn createSession(
     // BOO_FOREGROUND=1 keeps the daemon in the foreground, which is
     // useful for debugging.
     if (posix.getenv("BOO_FOREGROUND") != null) {
-        try daemonpkg.Daemon.run(alloc, .{
+        var opts: daemonpkg.Options = .{
             .name = name,
             .socket_path = sock,
             .listen_fd = listen_fd,
@@ -314,12 +330,15 @@ fn createSession(
             .state_dir = state_dir,
             .cwd = cwd,
             .max_scrollback = max_scrollback,
-        });
+        };
+        if (rows) |r| opts.rows = r;
+        if (cols) |c| opts.cols = c;
+        try daemonpkg.Daemon.run(alloc, opts);
         return;
     }
     const pid = try posix.fork();
     if (pid == 0) {
-        runDaemon(alloc, name, sock, listen_fd, cmd_argv, state_dir, cwd, max_scrollback);
+        runDaemon(alloc, name, sock, listen_fd, cmd_argv, state_dir, cwd, max_scrollback, rows, cols);
     }
     posix.close(listen_fd);
 
@@ -397,7 +416,8 @@ fn restoreOne(
     const cwd: ?[]const u8 = if (saved.len > 0) saved else null;
 
     // Detached, fresh shell ($SHELL), started in the saved directory.
-    try createSession(alloc, socket_dir, name, true, &.{}, cwd);
+    // No viewport size: a restored session is headless until attached.
+    try createSession(alloc, socket_dir, name, true, &.{}, cwd, null, null);
 }
 
 fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
@@ -999,6 +1019,8 @@ fn runDaemon(
     state_dir: ?[]const u8,
     cwd: ?[]const u8,
     max_scrollback: usize,
+    rows: ?u16,
+    cols: ?u16,
 ) noreturn {
     _ = posix.setsid() catch {};
 
@@ -1020,7 +1042,7 @@ fn runDaemon(
     }
     if (devnull > 2) posix.close(devnull);
 
-    daemonpkg.Daemon.run(alloc, .{
+    var opts: daemonpkg.Options = .{
         .name = name,
         .socket_path = sock,
         .listen_fd = listen_fd,
@@ -1028,7 +1050,10 @@ fn runDaemon(
         .state_dir = state_dir,
         .cwd = cwd,
         .max_scrollback = max_scrollback,
-    }) catch |err| {
+    };
+    if (rows) |r| opts.rows = r;
+    if (cols) |c| opts.cols = c;
+    daemonpkg.Daemon.run(alloc, opts) catch |err| {
         std.log.err("daemon failed: {}", .{err});
         posix.exit(1);
     };

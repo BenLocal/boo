@@ -22,6 +22,12 @@ pub const MsgType = enum(u8) {
     resize = 3,
     detach_req = 4,
     command = 5,
+    /// Marks this connection as a `boo ui` view. Sent right before the
+    /// attach so the daemon replays scrollback history on attach. A
+    /// daemon from before this message existed ignores the unknown type
+    /// and simply attaches the view with no history, so a new ui client
+    /// stays compatible with an already-running older daemon.
+    ui = 6,
 
     // Daemon to client.
     output = 64,
@@ -59,33 +65,6 @@ pub const SizePayload = struct {
         return .{
             .rows = std.mem.readInt(u16, payload[0..2], .little),
             .cols = std.mem.readInt(u16, payload[2..4], .little),
-        };
-    }
-};
-
-/// attach payload: rows, cols (u16 LE each) plus a flag byte. The flag's
-/// low bit marks a ui client (`boo ui`), which wants its scrollback
-/// history replayed on attach; a plain `boo attach` leaves it zero. A
-/// bare 4-byte size payload is also accepted and decodes as non-ui.
-pub const AttachPayload = struct {
-    rows: u16,
-    cols: u16,
-    ui: bool = false,
-
-    pub fn encode(self: AttachPayload) [5]u8 {
-        var buf: [5]u8 = undefined;
-        std.mem.writeInt(u16, buf[0..2], self.rows, .little);
-        std.mem.writeInt(u16, buf[2..4], self.cols, .little);
-        buf[4] = @intFromBool(self.ui);
-        return buf;
-    }
-
-    pub fn decode(payload: []const u8) error{InvalidPayload}!AttachPayload {
-        if (payload.len != 4 and payload.len != 5) return error.InvalidPayload;
-        return .{
-            .rows = std.mem.readInt(u16, payload[0..2], .little),
-            .cols = std.mem.readInt(u16, payload[2..4], .little),
-            .ui = payload.len == 5 and payload[4] != 0,
         };
     }
 };
@@ -178,20 +157,6 @@ test "size payload roundtrip" {
     const dec = try SizePayload.decode(&enc);
     try std.testing.expectEqual(size, dec);
     try std.testing.expectError(error.InvalidPayload, SizePayload.decode("abc"));
-}
-
-test "attach payload roundtrip carries the ui flag" {
-    const ui_client: AttachPayload = .{ .rows = 24, .cols = 80, .ui = true };
-    try std.testing.expectEqual(ui_client, try AttachPayload.decode(&ui_client.encode()));
-    const plain: AttachPayload = .{ .rows = 5, .cols = 10, .ui = false };
-    try std.testing.expectEqual(plain, try AttachPayload.decode(&plain.encode()));
-    // A bare 4-byte size payload decodes as a non-ui attach.
-    const sized = (SizePayload{ .rows = 7, .cols = 9 }).encode();
-    try std.testing.expectEqual(
-        AttachPayload{ .rows = 7, .cols = 9, .ui = false },
-        try AttachPayload.decode(&sized),
-    );
-    try std.testing.expectError(error.InvalidPayload, AttachPayload.decode("ab"));
 }
 
 test "argv roundtrip" {

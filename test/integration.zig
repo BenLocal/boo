@@ -592,6 +592,29 @@ test "window size: initial attach size and SIGWINCH resize reach the app" {
     }
 }
 
+test "new --rows/--cols births the session at that size" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A detached session is never attached, so it keeps the size it was
+    // born with: --rows/--cols must reach the child PTY at creation,
+    // not wait for an attach handshake. boo ui relies on this so a new
+    // session is shown at the viewport size from its first frame.
+    const result = try h.run(&.{ "new", "sized", "-d", "--rows", "30", "--cols", "100", "--", "/bin/sh" });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    try std.testing.expect(result.term == .Exited and result.term.Exited == 0);
+    try h.waitSessionUp("sized");
+
+    const size_file = try std.fmt.allocPrint(alloc, "{s}/size.txt", .{h.dir});
+    defer alloc.free(size_file);
+    const cmd = try std.fmt.allocPrint(alloc, "stty size > {s}", .{size_file});
+    defer alloc.free(cmd);
+    try h.sendLine("sized", cmd);
+    try waitFileEquals(alloc, size_file, "30 100\n");
+}
+
 test "default session name comes from the working directory" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -2212,6 +2235,33 @@ test "ui: kitty-encoded C-a is the prefix, not session input" {
     try std.testing.expect(std.mem.indexOf(u8, peek.stdout, "97;5u") == null);
 }
 
+test "ui: arming the prefix forces report-events, the release reverts it" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    try h.startDetached("armf", &.{"cat"});
+
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("armf");
+
+    // Arming the prefix forces kitty report-all + event-types on the
+    // real terminal, so the command key and its auto-repeats and
+    // release arrive as distinguishable CSI-u events the parser can
+    // swallow instead of leaking raw bytes into the focused session.
+    ui.clearOutput();
+    try ui.send("\x01");
+    try ui.waitFor("\x1b[=11;1u");
+
+    // The command key (create), then its auto-repeat and release the
+    // way a report-events terminal sends a held key. The create runs,
+    // and the release ends the swallow so the forced flags revert.
+    try ui.send("\x1b[99;1:1u\x1b[99;1:2u\x1b[99;1:3u");
+    try waitUiSessionCount(&h, 2);
+    try ui.waitFor("\x1b[=0;1u");
+}
+
 test "ui: prompts suspend the mirrored kitty flags" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);
@@ -2803,4 +2853,62 @@ test "ui without a tty fails cleanly" {
     defer alloc.free(result.stderr);
     try std.testing.expect(result.term == .Exited and result.term.Exited == 1);
     try std.testing.expect(std.mem.indexOf(u8, result.stderr, "requires a terminal") != null);
+}
+
+test "ui: attaching replays a session's pre-existing scrollback history" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Seed far more output than the screen is tall, so the earliest
+    // lines scroll into the daemon window's history BEFORE any ui
+    // attaches. A fresh ui view's terminal starts empty and cannot
+    // rebuild this from the live screen, so the daemon must replay the
+    // history on attach for a wheel-up to page it.
+    try h.startDetached("hist", &.{"sh"});
+    try h.sendLine("hist", "i=1; while [ $i -le 60 ]; do printf 'HIST-%03d\\n' $i; i=$((i+1)); done");
+    const seeded = try h.waitPeekContains("hist", "HIST-060");
+    alloc.free(seeded);
+
+    // The ui attaches after the history already exists and focuses the
+    // only session; its repaint reproduces the live screen (HIST-060).
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    try ui.waitFor("HIST-060");
+
+    // HIST-001 scrolled off the live screen, so it renders only if the
+    // daemon replayed history into the view. Wheel up over the viewport
+    // pages it in; over-scrolling clamps at the top.
+    ui.clearOutput();
+    for (0..40) |_| try ui.send("\x1b[<64;50;10M");
+    try ui.waitFor(" scrollback");
+    try ui.waitFor("HIST-001");
+}
+
+test "plain attach replays the visible screen only, never scrollback history" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // Same seeding: HIST-001 scrolls off the live screen. A plain attach
+    // is raw passthrough to the user's real terminal, where a history
+    // dump would spam their screen, so it must receive only the visible
+    // screen, never the scrolled-off history a ui view gets.
+    try h.startDetached("plain", &.{"sh"});
+    try h.sendLine("plain", "i=1; while [ $i -le 60 ]; do printf 'HIST-%03d\\n' $i; i=$((i+1)); done");
+    const seeded = try h.waitPeekContains("plain", "HIST-060");
+    alloc.free(seeded);
+
+    var client = try PtyClient.spawn(&h, &.{ "attach", "plain" }, 24, 80);
+    defer client.deinit();
+    // The repaint reproduces the visible screen, ending at HIST-060.
+    try client.waitFor("HIST-060");
+    // The daemon sends any history before the repaint, so if it had been
+    // (wrongly) sent it would already be here alongside HIST-060. The
+    // off-screen line must be absent.
+    try std.testing.expect(std.mem.indexOf(u8, client.output.items, "HIST-001") == null);
+
+    try client.send("\x01d");
+    try client.waitFor("detached from plain");
+    _ = try client.waitExit();
 }

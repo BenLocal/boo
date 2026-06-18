@@ -193,11 +193,11 @@ pub const Daemon = struct {
         const w = self.liveWindow() orelse return;
         if (w.child_pid <= 0) return;
 
-        var link_buf: [64]u8 = undefined;
-        const link = std.fmt.bufPrint(&link_buf, "/proc/{d}/cwd", .{w.child_pid}) catch return;
+        // Resolve the child's cwd through the portable helper: Linux reads
+        // /proc/<pid>/cwd, macOS uses proc_pidinfo. A bare /proc readlink
+        // here silently no-ops on macOS, leaving every session unsnapshot.
         var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const cwd = std.posix.readlink(link, &cwd_buf) catch return;
-        if (cwd.len == 0) return;
+        const cwd = cwdpkg.ofPid(&cwd_buf, w.child_pid) orelse return;
 
         const name = self.owned_name orelse self.opts.name;
         const path = paths.statePath(self.alloc, dir, name) catch return;

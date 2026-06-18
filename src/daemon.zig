@@ -13,6 +13,7 @@ const protocol = @import("protocol.zig");
 const keys = @import("keys.zig");
 const altscreen = @import("altscreen.zig");
 const paths = @import("paths.zig");
+const cwdpkg = @import("cwd.zig");
 const windowpkg = @import("window.zig");
 const Window = windowpkg.Window;
 const main = @import("main.zig");
@@ -29,8 +30,9 @@ pub const Options = struct {
     cols: u16 = 80,
     /// Directory under which the session's restore snapshot is written. Null disables snapshots.
     state_dir: ?[]const u8 = null,
-    /// Starting directory for the session command; set by `boo restore`
-    /// to re-create the session where it was. Null inherits the cwd.
+    /// Starting directory for the session command: set from `--cwd` for a
+    /// new session, or by `boo restore` to re-create the session where it
+    /// was. Null inherits the daemon's own directory.
     cwd: ?[]const u8 = null,
     /// Scrollback budget in bytes for the session terminal.
     max_scrollback: usize = config.default_max_scrollback,
@@ -493,6 +495,15 @@ pub const Daemon = struct {
                 }
             }
             conn.send(.ok, out.items);
+        } else if (std.mem.eql(u8, cmd, "cwd")) {
+            // Report the session command's current working directory so
+            // a new session created from `boo ui` can be born there.
+            if (self.liveWindow()) |w| {
+                var buf: [std.fs.max_path_bytes]u8 = undefined;
+                if (cwdpkg.ofPid(&buf, w.child_pid)) |dir| {
+                    conn.send(.ok, dir);
+                } else conn.send(.err, "working directory unavailable");
+            } else conn.send(.err, "no window");
         } else if (std.mem.eql(u8, cmd, "rename")) {
             if (argv.len != 2) {
                 conn.send(.err, "usage: rename <new-name>");

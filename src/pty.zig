@@ -94,8 +94,8 @@ pub const SpawnOptions = struct {
     env: *std.process.EnvMap,
     size: Winsize,
     /// Starting directory for the child. Null inherits the daemon's cwd
-    /// (the directory `boo new` ran in); `boo restore` sets it to the
-    /// session's saved directory.
+    /// (the directory `boo new` ran in); `--cwd` and `boo restore` set it
+    /// to a specific directory.
     cwd: ?[]const u8 = null,
 };
 

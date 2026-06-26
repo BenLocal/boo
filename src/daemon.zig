@@ -181,6 +181,15 @@ pub const Daemon = struct {
     /// restore, and how often orphaned snapshots are swept.
     const snapshot_interval_ms: i64 = 1_000;
 
+    /// Grace before a surviving daemon reaps a snapshot whose socket is
+    /// gone. A live session refreshes its snapshot every interval, so an
+    /// orphan younger than this may belong to a session that died moments
+    /// ago as part of a still-running `kill --all` (which removes sockets
+    /// one by one, in well under an interval). Waiting two intervals means
+    /// the whole batch outlives the bulk teardown and stays restorable,
+    /// while a single kill / clean exit is still reaped within ~2 ticks.
+    const orphan_grace_ms: i64 = 2 * snapshot_interval_ms;
+
     pub fn run(alloc: std.mem.Allocator, opts: Options) !void {
         var self: Daemon = .{
             .alloc = alloc,
@@ -270,7 +279,7 @@ pub const Daemon = struct {
         // snapshot on the way out; this sweep, run by every live daemon,
         // cleans them up. The socket dir is the snapshot's sibling.
         const sock_dir = std.fs.path.dirname(self.opts.socket_path) orelse ".";
-        paths.sweepOrphanSnapshots(dir, sock_dir);
+        paths.sweepOrphanSnapshots(dir, sock_dir, orphan_grace_ms);
     }
 
     /// Atomically write the session's current working directory to

@@ -140,20 +140,27 @@ pub fn restorableSessions(
 }
 
 /// Reap orphaned snapshots: delete every `<name>.state` in `state_dir`
-/// whose session is no longer live (no `<name>.sock` in `socket_dir`). A
-/// daemon calls this on each snapshot tick, so a snapshot left behind by a
-/// killed or cleanly-exited session is cleaned up while some other session
-/// still runs. A live session keeps its own snapshot (its socket exists);
-/// after a full shutdown no daemon runs the sweep, so those snapshots
-/// survive for `boo restore`. Best-effort: a directory that will not open
-/// or a file that will not unlink is left alone. If `socket_dir` itself
-/// cannot be opened nothing is swept — never reap when liveness is unknown.
-pub fn sweepOrphanSnapshots(state_dir: []const u8, socket_dir: []const u8) void {
+/// whose session is no longer live (no `<name>.sock` in `socket_dir`) AND
+/// whose snapshot has not been refreshed for at least `min_orphan_age_ms`.
+/// A daemon calls this on each snapshot tick, so a snapshot left behind by
+/// a killed or cleanly-exited session is cleaned up while some other
+/// session still runs. The age check protects a freshly-orphaned snapshot:
+/// during `kill --all` sockets vanish one at a time, and without the grace
+/// a still-living sibling would reap a just-killed session's snapshot
+/// before the teardown finished — losing snapshots the bulk shutdown was
+/// meant to keep. A live session keeps its own snapshot (its socket
+/// exists); after a full shutdown no daemon runs the sweep, so those
+/// snapshots survive for `boo restore`. Best-effort: a directory that will
+/// not open or a file that will not unlink is left alone. If `socket_dir`
+/// itself cannot be opened nothing is swept — never reap when liveness is
+/// unknown.
+pub fn sweepOrphanSnapshots(state_dir: []const u8, socket_dir: []const u8, min_orphan_age_ms: i64) void {
     var sdir = std.fs.cwd().openDir(state_dir, .{ .iterate = true }) catch return;
     defer sdir.close();
     var sockdir = std.fs.cwd().openDir(socket_dir, .{}) catch return;
     defer sockdir.close();
 
+    const now_ms = std.time.milliTimestamp();
     var it = sdir.iterate();
     while (it.next() catch null) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".state")) continue;
@@ -163,6 +170,17 @@ pub fn sweepOrphanSnapshots(state_dir: []const u8, socket_dir: []const u8) void 
         var buf: [max_name_len + ".sock".len]u8 = undefined;
         const sock = std.fmt.bufPrint(&buf, "{s}.sock", .{name}) catch continue;
         if (sockdir.access(sock, .{})) |_| continue else |_| {}
+        // Keep a freshly-orphaned snapshot: a live session rewrites its
+        // <name>.state every snapshot interval, so a snapshot still younger
+        // than the grace window may belong to a session that was killed
+        // moments ago as part of a `kill --all` that is still tearing down
+        // its siblings. Reaping it here would race the bulk teardown and
+        // lose a restorable snapshot. Only reap once it has gone stale —
+        // no refresh for min_orphan_age_ms — which a single kill or clean
+        // exit reaches within ~2 intervals while siblings keep running.
+        const st = sdir.statFile(entry.name) catch continue;
+        const mtime_ms: i64 = @intCast(@divFloor(st.mtime, std.time.ns_per_ms));
+        if (now_ms - mtime_ms < min_orphan_age_ms) continue;
         // Deleting the just-returned entry mid-iteration is safe on Linux.
         sdir.deleteFile(entry.name) catch {};
     }
@@ -309,7 +327,16 @@ test "restorableSessions lists snapshots without a live socket" {
     try std.testing.expectEqualStrings("dead", names[0]);
 }
 
-test "sweepOrphanSnapshots reaps snapshots without a live socket" {
+/// Push a file's mtime back by `age_ns` so a test can pretend the snapshot
+/// has gone stale (no live session refreshing it for that long).
+fn ageFile(dir: std.fs.Dir, sub_path: []const u8, age_ns: i128) !void {
+    var f = try dir.openFile(sub_path, .{});
+    defer f.close();
+    const t = std.time.nanoTimestamp() - age_ns;
+    try f.updateTimes(t, t);
+}
+
+test "sweepOrphanSnapshots reaps a stale snapshot without a live socket" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -326,20 +353,52 @@ test "sweepOrphanSnapshots reaps snapshots without a live socket" {
     var kdir = try tmp.dir.openDir("sock", .{});
     defer kdir.close();
 
-    // dead: a snapshot with no socket -> reaped.
+    // dead: a snapshot with no socket, stale past the grace window -> reaped.
     try sdir.writeFile(.{ .sub_path = "dead.state", .data = "/home/u\n" });
-    // live: a snapshot whose socket still exists -> kept.
+    try ageFile(sdir, "dead.state", 10 * std.time.ns_per_s);
+    // live: a snapshot whose socket still exists -> kept (even if fresh).
     try sdir.writeFile(.{ .sub_path = "live.state", .data = "/tmp\n" });
     try kdir.writeFile(.{ .sub_path = "live.sock", .data = "" });
     // an invalid name is left untouched.
     try sdir.writeFile(.{ .sub_path = ".hidden.state", .data = "/x" });
 
-    sweepOrphanSnapshots(state, sock);
+    sweepOrphanSnapshots(state, sock, std.time.ms_per_s);
 
-    // The orphan is gone; the live snapshot and the odd file remain.
+    // The stale orphan is gone; the live snapshot and the odd file remain.
     try std.testing.expectError(error.FileNotFound, sdir.access("dead.state", .{}));
     try sdir.access("live.state", .{});
     try sdir.access(".hidden.state", .{});
+}
+
+test "sweepOrphanSnapshots keeps a freshly orphaned snapshot (kill --all race)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("state");
+    try tmp.dir.makePath("sock");
+    const state = try tmp.dir.realpathAlloc(alloc, "state");
+    defer alloc.free(state);
+    const sock = try tmp.dir.realpathAlloc(alloc, "sock");
+    defer alloc.free(sock);
+
+    var sdir = try tmp.dir.openDir("state", .{});
+    defer sdir.close();
+    var kdir = try tmp.dir.openDir("sock", .{});
+    defer kdir.close();
+
+    // Simulate `kill --all` mid-teardown: session 'a' was just killed, so
+    // its socket is already gone but its snapshot is fresh; sibling 'b' is
+    // still alive and runs this sweep. Reaping 'a' here would lose a
+    // restorable snapshot the bulk teardown was meant to preserve.
+    try sdir.writeFile(.{ .sub_path = "a.state", .data = "/a\n" }); // fresh, no socket
+    try sdir.writeFile(.{ .sub_path = "b.state", .data = "/b\n" });
+    try kdir.writeFile(.{ .sub_path = "b.sock", .data = "" }); // b still live
+
+    sweepOrphanSnapshots(state, sock, std.time.ms_per_s);
+
+    // Both snapshots survive: 'a' is too fresh to reap, 'b' has a live socket.
+    try sdir.access("a.state", .{});
+    try sdir.access("b.state", .{});
 }
 
 test "socketDirFrom prefers BOO_DIR and creates it" {

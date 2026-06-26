@@ -377,6 +377,49 @@ pub fn parseModify(body: []const u8) ?ModifyKey {
     };
 }
 
+/// Re-encode a decoded kitty key into the byte form the focused app's
+/// keyboard protocol expects, written into `buf` (caller-owned; 8 bytes
+/// cover the legacy set, ~16 a CSI-u form). Used when boo keeps the
+/// outer terminal in kitty "disambiguate" mode but the focused app
+/// speaks a different protocol, so a key that arrived as `CSI u` must be
+/// translated before it is forwarded.
+///
+/// Scope: the keys flag-1 "disambiguate escape codes" actually
+/// re-encodes — Esc and Ctrl/Alt/Super combos of ASCII keys. Unmodified
+/// keys and keys with an unambiguous legacy form (arrows, function keys,
+/// Enter, Tab) keep their legacy bytes under flag 1, so they never reach
+/// here; a modified non-ASCII codepoint (cp > 0x7f) is out of scope and
+/// yields an empty slice.
+pub fn encodeForApp(buf: []u8, key: KittyKey, prot: Protocols) []const u8 {
+    const bitmask = (key.mods -| 1) & 0x3f; // drop the +1 offset and lock bits
+    // Unmodified keys carry their codepoint verbatim in every protocol:
+    // a disambiguate terminal emits the bare byte for them (Esc, Enter,
+    // Tab, Backspace, plain text).
+    if (bitmask == 0 and key.cp <= 0x7f) {
+        buf[0] = @intCast(key.cp);
+        return buf[0..1];
+    }
+    if (key.cp > 0x7f) return buf[0..0]; // out of scope (see doc)
+
+    if (prot.kitty) {
+        return std.fmt.bufPrint(buf, "\x1b[{d};{d}u", .{ key.cp, key.mods }) catch buf[0..0];
+    }
+    if (prot.modify) {
+        return std.fmt.bufPrint(buf, "\x1b[27;{d};{d}~", .{ key.mods, key.cp }) catch buf[0..0];
+    }
+    // Legacy: Alt prefixes ESC; Ctrl folds an ASCII key to its C0 byte.
+    const ctrl = bitmask & 0x4 != 0;
+    const alt = bitmask & 0x2 != 0;
+    var i: usize = 0;
+    if (alt) {
+        buf[i] = 0x1b;
+        i += 1;
+    }
+    buf[i] = if (ctrl) @intCast(key.cp & 0x1f) else @intCast(key.cp);
+    i += 1;
+    return buf[0..i];
+}
+
 const TestHandler = struct {
     alloc: std.mem.Allocator,
     cmds: std.ArrayList(Command) = .empty,
@@ -747,4 +790,40 @@ test "modify: kitty and modify decode side by side" {
     try p.feed("\x1b[97;5u\x1b[27;5;100~", both, &h);
     try std.testing.expectEqual(Command{ .detach = 0x04 }, h.cmds.items[1]);
     try std.testing.expectEqual(@as(usize, 0), h.forwarded.items.len);
+}
+
+test "encodeForApp: legacy encoding of the disambiguated set" {
+    var buf: [8]u8 = undefined;
+    const legacy: Protocols = .{}; // neither kitty nor modify
+    // Esc (cp 27, no mods): the bare byte.
+    try std.testing.expectEqualStrings("\x1b", encodeForApp(&buf, .{ .cp = 27, .mods = 1, .event = 1 }, legacy));
+    // Ctrl+C (mods=5 => ctrl): the C0 control byte 0x03.
+    try std.testing.expectEqualStrings("\x03", encodeForApp(&buf, .{ .cp = 'c', .mods = 5, .event = 1 }, legacy));
+    // Ctrl+A: 0x01.
+    try std.testing.expectEqualStrings("\x01", encodeForApp(&buf, .{ .cp = 'a', .mods = 5, .event = 1 }, legacy));
+    // Alt+x (mods=3 => alt): ESC then 'x'.
+    try std.testing.expectEqualStrings("\x1bx", encodeForApp(&buf, .{ .cp = 'x', .mods = 3, .event = 1 }, legacy));
+    // Ctrl+Alt+c (mods=7): ESC then 0x03.
+    try std.testing.expectEqualStrings("\x1b\x03", encodeForApp(&buf, .{ .cp = 'c', .mods = 7, .event = 1 }, legacy));
+    // Plain printable (no mods): the byte itself (Enter, Tab, 'a').
+    try std.testing.expectEqualStrings("a", encodeForApp(&buf, .{ .cp = 'a', .mods = 1, .event = 1 }, legacy));
+    try std.testing.expectEqualStrings("\r", encodeForApp(&buf, .{ .cp = 13, .mods = 1, .event = 1 }, legacy));
+}
+
+test "encodeForApp: kitty target re-encodes to canonical CSI u" {
+    var buf: [16]u8 = undefined;
+    const kitty: Protocols = .{ .kitty = true };
+    // Modified keys keep CSI u with the mods field.
+    try std.testing.expectEqualStrings("\x1b[99;5u", encodeForApp(&buf, .{ .cp = 'c', .mods = 5, .event = 1 }, kitty));
+    // Unmodified printable stays a bare byte even for a kitty app
+    // (that is what a disambiguate terminal emits for it).
+    try std.testing.expectEqualStrings("a", encodeForApp(&buf, .{ .cp = 'a', .mods = 1, .event = 1 }, kitty));
+}
+
+test "encodeForApp: modifyOtherKeys target uses CSI 27;mods;cp~" {
+    var buf: [16]u8 = undefined;
+    const modify: Protocols = .{ .modify = true };
+    try std.testing.expectEqualStrings("\x1b[27;5;99~", encodeForApp(&buf, .{ .cp = 'c', .mods = 5, .event = 1 }, modify));
+    // Unmodified printable is still the bare byte.
+    try std.testing.expectEqualStrings("a", encodeForApp(&buf, .{ .cp = 'a', .mods = 1, .event = 1 }, modify));
 }

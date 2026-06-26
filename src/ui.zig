@@ -53,7 +53,7 @@ const render_interval_ms: i64 = 15;
 /// A lone ESC held by the input parser is delivered as session input
 /// after this long without a follow-up byte. Escape sequences arrive
 /// as one chunk, so only a human pressing the ESC key waits this long.
-const esc_flush_ms: i64 = 50;
+const esc_flush_ms: i64 = 200;
 /// Rows per mouse wheel tick, both for paging local scrollback and
 /// for the arrow keys sent to alternate-screen applications.
 const wheel_lines = 3;
@@ -169,6 +169,20 @@ pub const Mouse = struct {
     pub fn isMotion(self: Mouse) bool {
         return self.code & 32 != 0;
     }
+
+    /// A wheel event's two low bits select its direction: 0 up, 1 down,
+    /// 2 left, 3 right. Modifier bits (2..4) live higher, so they do
+    /// not disturb this.
+    pub fn wheelDown(self: Mouse) bool {
+        return self.code & 0b11 == 1;
+    }
+
+    /// A horizontal (left/right) wheel. boo scrolls only vertically, so
+    /// these are ignored: a trackpad's sideways jitter during a slow
+    /// vertical scroll would otherwise be read as up/down and fight it.
+    pub fn wheelHorizontal(self: Mouse) bool {
+        return self.code & 0b11 >= 2;
+    }
 };
 
 pub const InputEvent = union(enum) {
@@ -258,6 +272,18 @@ pub const InputParser = struct {
     /// so a sequence in flight while the mirror flips replays whole
     /// instead of splitting.
     prot: keys.Protocols = .{},
+    /// Re-encode forwarded keys to `app_prot` instead of replaying the
+    /// outer terminal's bytes. Set when boo keeps the outer terminal in
+    /// kitty "disambiguate" mode but the focused app speaks another
+    /// protocol, so a key that arrived as CSI-u must be translated.
+    /// Off by default: the outer terminal then matches the app and keys
+    /// forward verbatim, exactly as before.
+    translate: bool = false,
+    /// The focused app's keyboard protocol; the target for `translate`.
+    app_prot: keys.Protocols = .{},
+    /// Scratch for a re-encoded forwarded key. The emitted slice aliases
+    /// it and is consumed before the next key is parsed.
+    reencode_buf: [16]u8 = undefined,
     /// Codepoint of the command key that ran the most recent prefix
     /// command while its auto-repeats and release are still expected.
     /// The UI forces kitty report-events for the duration, so the held
@@ -607,17 +633,30 @@ pub const InputParser = struct {
 
         if (key.cp == 27 and plain and !release) {
             // The Esc key, unambiguously encoded: deliver it as the
-            // cancel key, with the original bytes for forwarding.
+            // cancel key, with bytes the focused app understands.
             self.held_len = 0;
-            return handler.event(.{ .esc = seq });
+            const bytes = if (self.translate)
+                keys.encodeForApp(&self.reencode_buf, key, self.app_prot)
+            else
+                seq;
+            return handler.event(.{ .esc = bytes });
         }
 
         // Some other key (Shift+Enter, Ctrl+C, ...): the session's
-        // input, exactly as the terminal encoded it. This includes
-        // the release of a key whose press the UI consumed (Esc
-        // after cancelling a prompt): kitty applications must
-        // tolerate unmatched releases, e.g. after a focus change, so
-        // no swallow state is kept.
+        // input. When the focused app speaks the same protocol as the
+        // outer terminal, forward the bytes verbatim (this includes the
+        // release of a key whose press the UI consumed; kitty apps
+        // tolerate unmatched releases). When boo forced kitty on the
+        // outer terminal but the app does not speak it, re-encode the
+        // key to the app's protocol; legacy / modifyOtherKeys apps get
+        // no release events, so drop a release rather than re-encode it.
+        if (self.translate) {
+            self.held_len = 0;
+            if (release) return;
+            const bytes = keys.encodeForApp(&self.reencode_buf, key, self.app_prot);
+            if (bytes.len > 0) try handler.event(.{ .forward = bytes });
+            return;
+        }
         try self.flushHeld(handler);
     }
 
@@ -1179,6 +1218,46 @@ const enter_sequence =
 /// reset_state_sequence turns every mode above back off.
 const restore_sequence = windowpkg.reset_state_sequence ++ "\x1b[?1049l";
 
+/// True when `buf` holds a `CSI ? <params> <final>` reply — the shape of
+/// both the kitty keyboard flags report (final 'u', answering CSI ? u)
+/// and the Primary DA fence (final 'c', answering CSI c).
+fn csiQuestionReply(buf: []const u8, final: u8) bool {
+    var i: usize = 0;
+    while (std.mem.indexOfScalarPos(u8, buf, i, 0x1b)) |esc| : (i = esc + 1) {
+        if (esc + 2 >= buf.len) break;
+        if (buf[esc + 1] != '[' or buf[esc + 2] != '?') continue;
+        var j = esc + 3;
+        while (j < buf.len and (std.ascii.isDigit(buf[j]) or buf[j] == ';')) j += 1;
+        if (j < buf.len and buf[j] == final) return true;
+    }
+    return false;
+}
+
+/// Probe whether the outer terminal supports the kitty keyboard
+/// protocol. Send the flags query (CSI ? u) and a Primary DA fence
+/// (CSI c) that every terminal answers; a kitty-capable terminal
+/// replies `CSI ? <flags> u` before the DA reply. Reads at most ~250 ms;
+/// the DA reply ends the wait early. Any I/O hiccup yields false (the
+/// safe fallback: boo keeps the legacy Esc-flush timeout).
+fn detectOuterKitty(tty: posix.fd_t) bool {
+    protocol.writeAll(tty, "\x1b[?u\x1b[c") catch return false;
+    var acc: [512]u8 = undefined;
+    var len: usize = 0;
+    const deadline = std.time.milliTimestamp() + 250;
+    while (len < acc.len) {
+        const now = std.time.milliTimestamp();
+        if (now >= deadline) break;
+        var fds = [_]posix.pollfd{.{ .fd = tty, .events = posix.POLL.IN, .revents = 0 }};
+        const ready = posix.poll(&fds, @intCast(deadline - now)) catch break;
+        if (ready == 0 or fds[0].revents & posix.POLL.IN == 0) break;
+        const n = posix.read(tty, acc[len..]) catch break;
+        if (n == 0) break;
+        len += n;
+        if (csiQuestionReply(acc[0..len], 'c')) break; // DA fence arrived
+    }
+    return csiQuestionReply(acc[0..len], 'u');
+}
+
 pub fn run(alloc: std.mem.Allocator, dir: []const u8, max_scrollback: usize) !void {
     const tty: posix.fd_t = 0;
     if (!posix.isatty(tty)) return error.NotATty;
@@ -1218,6 +1297,10 @@ pub fn run(alloc: std.mem.Allocator, dir: []const u8, max_scrollback: usize) !vo
     // longer EOF guard.
     defer client.restoreTty(tty, saved, restore_sequence, ui.eof_guard, ui.parser.swallow_cp orelse 0);
     try protocol.writeAll(1, enter_sequence);
+
+    // Probe kitty-keyboard support so the Esc key is reported as CSI 27 u
+    // and a split escape sequence over SSH is never misread as Esc.
+    ui.outer_kitty = detectOuterKitty(tty);
 
     const ws = ptypkg.getSize(tty) catch ptypkg.makeWinsize(24, 80);
     ui.layout = .init(ws.row, ws.col);
@@ -1297,6 +1380,12 @@ const Ui = struct {
     /// kitty-protocol application is focused and no UI prompt owns
     /// the keyboard.
     kitty_flags: u5 = 0,
+    /// The outer terminal supports the kitty keyboard protocol (probed
+    /// once at startup). When true, boo keeps "disambiguate escape
+    /// codes" set so the Esc key arrives as CSI 27 u and a lone \x1b is
+    /// always an incomplete sequence — a split escape sequence over SSH
+    /// can no longer be misread as the Esc key.
+    outer_kitty: bool = false,
     /// modifyOtherKeys=2 state currently applied to the user's real
     /// terminal, mirroring the focused view under the same rules.
     modify_keys: bool = false,
@@ -1508,15 +1597,27 @@ const Ui = struct {
         // The status bar shows the keybind list while the prefix is
         // armed, so arming and disarming both need a repaint.
         const was_pending = self.parser.pending_prefix;
+        // When boo forces kitty "disambiguate" on the outer terminal but
+        // the focused app speaks another protocol, the parser re-encodes
+        // forwarded keys to the app's protocol; otherwise it forwards
+        // their bytes verbatim (outer terminal already matches the app).
+        const app_prot: keys.Protocols = if (self.liveView()) |v| .{
+            .kitty = v.term.screens.active.kitty_keyboard.current().int() != 0,
+            .modify = v.term.flags.modify_other_keys_2,
+        } else .{};
+        self.parser.app_prot = app_prot;
+        self.parser.translate = self.outer_kitty and !app_prot.kitty;
         try self.parser.feed(buf[0..n], .{
             .kitty = self.kitty_flags != 0,
             .modify = self.modify_keys,
         }, Handler{ .ui = self });
         if (self.parser.pending_prefix != was_pending) self.need_render = true;
-        // A read that ends in a bare ESC is ambiguous: the ESC key,
-        // or a split escape sequence. Deliver it on a short timeout
-        // instead of waiting for the next keypress.
-        self.esc_deadline = if (self.parser.held_len == 1)
+        // A read ending in a bare ESC is ambiguous: the Esc key, or a
+        // split escape sequence. In kitty mode the Esc key arrives as
+        // CSI 27 u, so a lone \x1b is always an incomplete sequence and
+        // must NOT be flushed as Esc — this is the SSH split-sequence
+        // misfire. Only the non-kitty fallback delivers it on a timeout.
+        self.esc_deadline = if (self.parser.held_len == 1 and self.kitty_flags == 0)
             std.time.milliTimestamp() + esc_flush_ms
         else
             0;
@@ -1575,6 +1676,12 @@ const Ui = struct {
             // CSI-u events the parser can swallow, instead of ambiguous
             // raw bytes that would leak into the focused session.
             if (self.prefixEngaged()) kitty |= report_events_flags;
+            // Keep "disambiguate escape codes" set whenever the outer
+            // terminal supports kitty, so the Esc key is reported as
+            // CSI 27 u and a lone \x1b is never the Esc key. Forwarded
+            // keys are re-encoded to the focused app's protocol (see
+            // readTty / InputParser.translate).
+            if (self.outer_kitty) kitty |= 0b1;
         }
         if (kitty != self.kitty_flags) {
             self.kitty_flags = kitty;
@@ -1901,8 +2008,10 @@ const Ui = struct {
             switch (self.layout.hit(x, y)) {
                 .viewport => return self.wheelViewport(m),
                 else => {
-                    // Wheel over the sidebar scrolls the session list.
-                    const down = m.code & 1 != 0;
+                    // Wheel over the sidebar scrolls the session list;
+                    // a horizontal wheel does nothing.
+                    if (m.wheelHorizontal()) return;
+                    const down = m.wheelDown();
                     if (down) {
                         self.scroll += 1;
                     } else {
@@ -1960,7 +2069,9 @@ const Ui = struct {
     fn wheelViewport(self: *Ui, m: Mouse) !void {
         const v = self.liveView() orelse return;
         if (v.term.flags.mouse_event != .none) return self.forwardMouse(m);
-        const down = m.code & 1 != 0;
+        // A horizontal wheel does not scroll the vertical viewport.
+        if (m.wheelHorizontal()) return;
+        const down = m.wheelDown();
         if (v.app_alt) {
             const seq: []const u8 = if (v.term.modes.get(.cursor_keys))
                 (if (down) "\x1bOB" else "\x1bOA")
@@ -3546,6 +3657,70 @@ test "parser: plain bytes pass through" {
     try p.feed("hello", .{}, &h);
     try std.testing.expectEqualStrings("hello", h.forwarded.items);
     try std.testing.expectEqual(@as(usize, 0), h.events.items.len);
+}
+
+test "parser: translate re-encodes a forwarded kitty key for a legacy app" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // boo forced kitty-disambiguate on the outer terminal, but the focused
+    // app is a legacy shell: a forwarded Ctrl+C (kitty CSI-u) must reach it
+    // as the C0 byte 0x03, not the kitty encoding.
+    p.translate = true;
+    p.app_prot = .{}; // legacy
+    try p.feed("\x1b[99;5u", .{ .kitty = true }, &h);
+    try std.testing.expectEqualStrings("\x03", h.forwarded.items);
+}
+
+test "parser: translate delivers a kitty Esc as cancel with the legacy byte" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    p.translate = true;
+    p.app_prot = .{};
+    try p.feed("\x1b[27u", .{ .kitty = true }, &h);
+    try std.testing.expectEqualStrings("\x1b", h.escs.items);
+}
+
+test "parser: no translate keeps kitty keys verbatim for a kitty app" {
+    var h: TestHandler = .{ .alloc = std.testing.allocator };
+    defer h.deinit();
+    var p: InputParser = .{};
+    // translate defaults false: a Ctrl+B forwarded to a kitty app keeps
+    // its exact CSI-u bytes (no re-encode), unchanged behavior.
+    try p.feed("\x1b[98;5u", .{ .kitty = true }, &h);
+    try std.testing.expectEqualStrings("\x1b[98;5u", h.forwarded.items);
+}
+
+test "csiQuestionReply: kitty flags report vs DA fence" {
+    // A kitty flags report (answer to CSI ? u).
+    try std.testing.expect(csiQuestionReply("\x1b[?1u", 'u'));
+    try std.testing.expect(csiQuestionReply("noise\x1b[?5u", 'u'));
+    // The DA fence is present (final 'c'), but no kitty report (final 'u').
+    try std.testing.expect(csiQuestionReply("\x1b[?62;1;6c", 'c'));
+    try std.testing.expect(!csiQuestionReply("\x1b[?62;1;6c", 'u'));
+    // Both, in order: kitty report then DA fence.
+    try std.testing.expect(csiQuestionReply("\x1b[?0u\x1b[?62c", 'u'));
+    // Not a `CSI ?` reply at all.
+    try std.testing.expect(!csiQuestionReply("\x1b[A", 'u'));
+    try std.testing.expect(!csiQuestionReply("\x1b[?", 'u')); // truncated
+}
+
+test "Mouse: wheel direction distinguishes vertical from horizontal" {
+    const mk = struct {
+        fn m(code: u16) Mouse {
+            return .{ .code = code, .x = 1, .y = 1, .release = false };
+        }
+    }.m;
+    // SGR wheel buttons: 64 up, 65 down, 66 left, 67 right.
+    try std.testing.expect(!mk(64).wheelDown());
+    try std.testing.expect(mk(65).wheelDown());
+    try std.testing.expect(!mk(64).wheelHorizontal());
+    try std.testing.expect(!mk(65).wheelHorizontal());
+    try std.testing.expect(mk(66).wheelHorizontal()); // left
+    try std.testing.expect(mk(67).wheelHorizontal()); // right
+    // Modifier bits (shift=4) do not disturb the direction's low 2 bits.
+    try std.testing.expect(mk(64 + 4 + 3).wheelHorizontal()); // shift+right
 }
 
 test "parser: prefix commands" {

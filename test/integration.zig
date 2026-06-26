@@ -294,6 +294,12 @@ const PtyClient = struct {
     pid: posix.pid_t,
     output: std.ArrayList(u8) = .empty,
     exited: ?u32 = null,
+    /// Answer boo's startup terminal queries like a real terminal: the
+    /// Primary DA fence always (so the kitty handshake returns at once
+    /// instead of stalling), and the kitty keyboard flags report when
+    /// `reply_kitty` is set, so boo enables the kitty input path.
+    reply_kitty: bool = false,
+    handshake_answered: bool = false,
 
     fn spawn(
         harness: *Harness,
@@ -418,6 +424,17 @@ const PtyClient = struct {
         };
         if (got == 0) return error.ClientGone;
         try self.output.appendSlice(self.alloc, buf[0..got]);
+        // Answer boo's startup kitty/DA handshake once, like a terminal:
+        // the kitty flags report (when requested) precedes the DA fence
+        // boo waits on. The query (CSI ? u, CSI c) shows up in boo's
+        // output stream here.
+        if (!self.handshake_answered and
+            std.mem.indexOf(u8, self.output.items, "\x1b[c") != null)
+        {
+            self.handshake_answered = true;
+            if (self.reply_kitty) try self.send("\x1b[?1u");
+            try self.send("\x1b[?62c");
+        }
         return true;
     }
 
@@ -1981,6 +1998,27 @@ test "ui: clicking a session in the sidebar focuses it" {
     ui.clearOutput();
     try ui.send("\x1b[<0;5;1M\x1b[<0;5;1m");
     try ui.waitFor("ONE-MARK");
+}
+
+test "ui: the kitty handshake enables the kitty input path without breaking the ui" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+    try h.startDetached("kit", &.{"cat"});
+    try h.sendLine("kit", "KIT-MARK");
+    const seeded = try h.waitPeekContains("kit", "KIT-MARK");
+    alloc.free(seeded);
+
+    // Answer the kitty query so boo's probe enables the disambiguate
+    // input path; the ui must still start, render the session, and
+    // route a keystroke to it.
+    var ui = try PtyClient.spawn(&h, &.{"ui"}, 24, 100);
+    defer ui.deinit();
+    ui.reply_kitty = true;
+    try ui.waitFor("KIT-MARK");
+    try ui.send("hello");
+    const seen = try h.waitPeekContains("kit", "hello");
+    alloc.free(seen);
 }
 
 test "ui: create and kill sessions from the ui" {

@@ -39,6 +39,7 @@ pub const overview =
     \\  Administration
     \\    kill <name | --all>          end a session, or all of them
     \\    restore [name]               re-create a session from its snapshot
+    \\    restart                      relaunch every daemon from the new binary
     \\    rename <name> <new-name>     rename a session
     \\
     \\  Information
@@ -322,6 +323,26 @@ pub const commands = [_]Entry{
         \\examples:
         \\  boo restore work
         \\  boo restore
+        \\
+        ,
+    },
+    .{
+        .name = "restart",
+        .body =
+        \\usage: boo restart
+        \\
+        \\Relaunch every running session's daemon from the current boo
+        \\binary, keeping each session in its saved working directory.
+        \\Handy after installing a new boo: existing daemons keep running
+        \\the old code until restarted.
+        \\
+        \\Each session is quit and restored from its snapshot, so — like
+        \\restore — the program running inside is replaced by a fresh
+        \\$SHELL in the saved directory (boo snapshots the cwd, not live
+        \\process state). Sessions stay detached; attach to them as usual.
+        \\
+        \\example:
+        \\  boo restart
         \\
         ,
     },

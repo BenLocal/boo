@@ -74,6 +74,7 @@ pub fn main() !void {
     if (eql(cmd, "peek")) return cmdPeek(alloc, rest);
     if (eql(cmd, "wait")) return cmdWait(alloc, rest);
     if (eql(cmd, "kill")) return cmdKill(alloc, rest);
+    if (eql(cmd, "restart")) return cmdRestart(alloc, rest);
     if (eql(cmd, "rename")) return cmdRename(alloc, rest);
     if (eql(cmd, "version") or eql(cmd, "-V") or eql(cmd, "--version")) return cmdVersion(alloc);
     if (eql(cmd, "help") or eql(cmd, "-h") or eql(cmd, "--help")) return cmdHelp(alloc, rest);
@@ -449,6 +450,84 @@ fn restoreOne(
     // Detached, fresh shell ($SHELL), started in the saved directory.
     // No viewport size: a restored session is headless until attached.
     try createSession(alloc, socket_dir, name, true, &.{}, cwd, null, null, null);
+}
+
+/// Relaunch every running session's daemon from the current binary,
+/// preserving each session's working directory. Useful after installing a
+/// new boo: existing daemons keep running the old code until restarted.
+/// Each session is quit and then restored from its snapshot, so — as with
+/// restore — the program running inside is replaced by a fresh $SHELL in
+/// the saved directory (boo snapshots the cwd, not live process state).
+fn cmdRestart(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {
+    for (args) |arg| {
+        if (isHelpFlag(arg)) return printHelpPage("restart");
+        usageFail("restart", "unexpected argument '{s}'", .{arg});
+    }
+
+    const dir = try paths.socketDir(alloc);
+    defer alloc.free(dir);
+    // Snapshots live in the config dir; with no config dir there is nothing
+    // to restore from, so refuse before killing anything.
+    const state_dir = config.configDir(alloc) catch null;
+    defer if (state_dir) |s| alloc.free(s);
+    const sdir = state_dir orelse
+        fail(exit_runtime, "no config dir: cannot restart (snapshots unavailable)", .{});
+
+    const sessions = try paths.listSessions(alloc, dir);
+    defer {
+        for (sessions) |s| alloc.free(s);
+        alloc.free(sessions);
+    }
+    if (sessions.len == 0) return stdoutWrite("no sessions to restart\n");
+
+    // Quit every running daemon. Snapshots are left in place; a surviving
+    // daemon's sweep keeps a freshly-orphaned snapshot for a grace window,
+    // so the whole batch outlives this teardown and can be brought back.
+    for (sessions) |name| {
+        const sock = try paths.socketPath(alloc, dir, name);
+        defer alloc.free(sock);
+        const result = client.control(alloc, sock, &.{"quit"}, null) catch {
+            // Already gone; drop a stale socket so the restore can rebind.
+            std.fs.cwd().deleteFile(sock) catch {};
+            continue;
+        };
+        alloc.free(result.text);
+    }
+
+    // A daemon removes its socket only after draining its final reply, so
+    // wait for the sockets to disappear before restoring — otherwise the
+    // restore would see the session as still running.
+    waitGone(alloc, dir, sessions);
+
+    // Bring each session back from its snapshot, in its saved directory, as
+    // a detached headless daemon running the (new) current binary.
+    // restoreOne -> createSession prints the restored name on stdout, so
+    // there is no need to echo it again here.
+    for (sessions) |name| {
+        restoreOne(alloc, dir, sdir, name) catch |err| {
+            std.debug.print("boo: restart {s} failed: {s}\n", .{ name, @errorName(err) });
+            continue;
+        };
+    }
+}
+
+/// Best-effort wait until none of `names` has a live socket in `dir`, up to
+/// a few seconds. Used by restart between quitting daemons and restoring
+/// them, so the restore does not race a daemon still removing its socket.
+fn waitGone(alloc: std.mem.Allocator, dir: []const u8, names: []const []const u8) void {
+    const deadline = std.time.milliTimestamp() + 5_000;
+    while (true) {
+        var all_gone = true;
+        for (names) |name| {
+            const sock = paths.socketPath(alloc, dir, name) catch continue;
+            defer alloc.free(sock);
+            if (std.fs.cwd().access(sock, .{})) |_| {
+                all_gone = false;
+            } else |_| {}
+        }
+        if (all_gone or std.time.milliTimestamp() >= deadline) return;
+        std.Thread.sleep(20 * std.time.ns_per_ms);
+    }
 }
 
 fn cmdAttach(alloc: std.mem.Allocator, args: []const [:0]const u8) !void {

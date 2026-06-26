@@ -612,6 +612,52 @@ test "snapshot GC: a running daemon reaps an orphaned snapshot" {
     try std.fs.cwd().access(keeper_state, .{});
 }
 
+test "restart relaunches every running session in its saved directory" {
+    const alloc = std.testing.allocator;
+    var h = try Harness.init(alloc);
+    defer h.deinit();
+
+    // A known directory the sessions run in, so we can prove restart kept
+    // each session's working directory.
+    const work = try std.fs.path.join(alloc, &.{ h.dir, "work" });
+    defer alloc.free(work);
+    try std.fs.cwd().makePath(work);
+    var real_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = try std.fs.cwd().realpath(work, &real_buf);
+
+    // Two detached sessions rooted in that directory.
+    try h.runOk(&.{ "new", "a", "-d", "--cwd", work, "--", "cat" });
+    try h.waitSessionUp("a");
+    try h.runOk(&.{ "new", "b", "-d", "--cwd", work, "--", "cat" });
+    try h.waitSessionUp("b");
+
+    // Wait for both snapshots so restart has a directory to restore from.
+    const a_state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "a.state" });
+    defer alloc.free(a_state);
+    const b_state = try std.fs.path.join(alloc, &.{ h.dir, "boo", "b.state" });
+    defer alloc.free(b_state);
+    var d = Deadline.init(default_timeout_ms);
+    while (true) {
+        const a_ok = if (std.fs.cwd().access(a_state, .{})) |_| true else |_| false;
+        const b_ok = if (std.fs.cwd().access(b_state, .{})) |_| true else |_| false;
+        if (a_ok and b_ok) break;
+        try d.tick("snapshots never written");
+    }
+
+    // Restart every daemon, as one would after dropping in a new binary.
+    try h.runOk(&.{"restart"});
+
+    // Both sessions are up again, each fresh shell back in its saved dir.
+    try h.waitSessionUp("a");
+    try h.waitSessionUp("b");
+    try h.sendLine("a", "pwd");
+    const pa = try h.waitPeekContains("a", real);
+    defer alloc.free(pa);
+    try h.sendLine("b", "pwd");
+    const pb = try h.waitPeekContains("b", real);
+    defer alloc.free(pb);
+}
+
 test "vt sequences: cursor movement, SGR, and clear are emulated" {
     const alloc = std.testing.allocator;
     var h = try Harness.init(alloc);

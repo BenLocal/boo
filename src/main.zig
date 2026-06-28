@@ -12,7 +12,7 @@ const protocol = @import("protocol.zig");
 const ui = @import("ui.zig");
 const config = @import("config.zig");
 
-pub const version = "0.6.2";
+pub const version = "0.6.3";
 
 /// Exit codes, documented in `boo help`.
 const exit_runtime: u8 = 1;
@@ -1418,6 +1418,7 @@ test {
     _ = @import("pty.zig");
     _ = @import("altscreen.zig");
     _ = @import("oscquery.zig");
+    _ = @import("osc52.zig");
     _ = @import("window.zig");
     _ = @import("daemon.zig");
     _ = @import("client.zig");
